@@ -1,0 +1,31 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "obsassist"
+version = "0.1.0"
+description = "Obsidian PARA notes AI assistant powered by Ollama"
+requires-python = ">=3.11"
+readme = "README.md"
+dependencies = [
+    "click>=8.1",
+    "pyyaml>=6.0",
+    "httpx>=0.27",
+    "rich>=13.0",
+]
+
+[project.scripts]
+obsassist = "obsassist.cli:main"
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0",
+    "pytest-cov>=5.0",
+]
+
+[tool.hatch.build.targets.wheel]
+packages = ["obsassist"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
