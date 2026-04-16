@@ -1,0 +1,40 @@
+# Path to the root of your Obsidian vault (Windows path example)
+vault_root: "C:/Users/YOUR_USERNAME/Documents/Obsidian Vault"
+
+# File extensions to process
+include_extensions:
+  - .md
+
+# Paths to exclude (relative to vault_root).
+# Files/directories that start with any of these prefixes are skipped.
+exclude_paths:
+  - Resources/
+  - Templates/
+  - Files/
+  - Excalidraw/
+  - .obsidian/
+
+# Priority weights for each top-level folder (used for batch ordering, future feature)
+path_priority:
+  Daily: 1.0
+  Buffer: 0.9
+  Projects: 0.9
+  Areas: 0.8
+  Archive: 0.2
+
+# Date format used in notes and filenames
+date_format: "%Y-%m-%d"
+
+# Ollama server settings
+ollama:
+  base_url: "http://localhost:11434"
+  model: "llama3:8b"
+  temperature: 0.2
+
+# Assistant block settings (how the block is written into notes)
+assistant_block:
+  heading: "## Assistant"
+  sections:
+    - Summary
+    - Questions
+    - "Metadata suggestions"
