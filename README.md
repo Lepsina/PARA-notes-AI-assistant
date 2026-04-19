@@ -23,6 +23,9 @@ The block is inserted at the end of the note on the first run and updated in-pla
 subsequent run — no other content is touched.  Before writing, the tool shows a colour diff and
 asks for confirmation (pass `--yes` to skip).
 
+It also provides a **full-text search index** powered by SQLite FTS5 so you can search across your
+entire vault from the command line without touching Obsidian.
+
 ---
 
 ## Requirements
@@ -30,8 +33,11 @@ asks for confirmation (pass `--yes` to skip).
 | Dependency | Version |
 |---|---|
 | Python | ≥ 3.11 |
-| [Ollama](https://ollama.com/download) | any recent version |
+| [Ollama](https://ollama.com/download) | any recent version (for analyze/metadata) |
 | Model | `llama3:8b` (or change in config) |
+
+> The indexing and search commands require **no additional dependencies** beyond the base install —
+> SQLite FTS5 is bundled with Python's standard library.
 
 ---
 
@@ -72,6 +78,9 @@ exclude_paths:
   - Excalidraw/
   - .obsidian/
 
+# Optional: override the default index location
+# index_path: "C:/Users/YOUR_USERNAME/AppData/Local/obsassist/index.sqlite"
+
 ollama:
   base_url: "http://localhost:11434"
   model: "llama3:8b"
@@ -84,7 +93,7 @@ All fields are optional — the tool falls back to sensible defaults.
 
 ## Usage
 
-Make sure Ollama is running first:
+Make sure Ollama is running first (only needed for `analyze` / `metadata`):
 
 ```powershell
 ollama serve           # in a separate terminal
@@ -119,6 +128,61 @@ obsassist analyze --file note.md --config path\to\config.yml
 
 ---
 
+## Indexing
+
+The index lets you search your entire vault for notes that contain specific words or phrases.
+It is stored **outside the vault** so sync tools (iCloud, OneDrive, Obsidian Sync) never touch it.
+
+### Default index location
+
+| Platform | Path |
+|---|---|
+| Windows | `%LOCALAPPDATA%\obsassist\index.sqlite` (e.g. `C:\Users\lepsina\AppData\Local\obsassist\index.sqlite`) |
+| Linux / macOS | `~/.local/share/obsassist/index.sqlite` |
+
+You can override the location via `index_path` in `config.yml` or with the `--index-path` flag.
+Parent directories are created automatically.
+
+### Build the index (full rebuild)
+
+Run this once after installation, or any time you want a fresh start:
+
+```powershell
+obsassist index build --config "C:\path\to\config.yml"
+```
+
+### Update the index (incremental)
+
+Run this regularly to pick up new and changed notes without re-indexing everything:
+
+```powershell
+obsassist index update --config "C:\path\to\config.yml"
+```
+
+Only files whose `mtime`, `size`, or content hash have changed are re-indexed.
+Deleted files are automatically removed from the index.
+
+### Search the index
+
+```powershell
+obsassist search "тщеславие" --config "C:\path\to\config.yml"   # Cyrillic (Unicode is fully supported)
+obsassist search "creative writing" --limit 10
+```
+
+The search uses SQLite FTS5 — plain-text queries work out of the box, and FTS5 query syntax
+(phrase search `"two words"`, negation `-word`, column filters `title:word`) is also supported.
+
+Output is a ranked table with file path, note title, and a content snippet.
+
+### Override the index path on the command line
+
+```powershell
+obsassist index build --index-path D:\my-index.sqlite
+obsassist search "query"  --index-path D:\my-index.sqlite
+```
+
+---
+
 ## Obsidian integration (Shell Commands plugin)
 
 Install the [Shell Commands](https://github.com/Taitava/obsidian-shellcommands) community plugin,
@@ -144,8 +208,10 @@ PARA-notes-AI-assistant/
 ├── pyproject.toml          # build config, dependencies, obsassist entrypoint
 ├── config.example.yml      # sample configuration (copy to vault)
 ├── obsassist/
-│   ├── cli.py              # Click commands: analyze, metadata
-│   ├── config.py           # YAML config loading
+│   ├── cli.py              # Click commands: analyze, metadata, index, search
+│   ├── config.py           # YAML config loading + get_index_path()
+│   ├── indexer.py          # SQLite FTS5 index build/update + metadata extraction
+│   ├── search.py           # Full-text search over the FTS5 index
 │   ├── parser.py           # ## Assistant block insert/update/parse
 │   ├── filters.py          # exclude-path logic
 │   ├── diff.py             # unified diff generation
@@ -154,7 +220,9 @@ PARA-notes-AI-assistant/
 └── tests/
     ├── test_parser.py
     ├── test_filters.py
-    └── test_diff.py
+    ├── test_diff.py
+    ├── test_indexer.py
+    └── test_search.py
 ```
 
 ---
@@ -170,7 +238,7 @@ python -m pytest
 
 ## Excluded paths
 
-The following vault directories are **never** read or modified:
+The following vault directories are **never** read or modified by any command:
 
 | Path | Reason |
 |---|---|

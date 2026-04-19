@@ -8,6 +8,15 @@ obsassist analyze  --file <path> [--yes] [--config <path>]
 obsassist metadata --file <path> [--yes] [--config <path>]
     Metadata suggestions only (Summary / Questions are preserved when a
     block already exists).
+
+obsassist index build [--config <path>] [--index-path <path>]
+    Full rebuild of the full-text search index from scratch.
+
+obsassist index update [--config <path>] [--index-path <path>]
+    Incremental index update (add/update changed files, remove deleted ones).
+
+obsassist search "<query>" [--config <path>] [--index-path <path>] [--limit N]
+    Full-text search across all indexed notes.
 """
 from __future__ import annotations
 
@@ -17,10 +26,12 @@ from pathlib import Path
 import click
 from rich.console import Console
 from rich.syntax import Syntax
+from rich.table import Table
 
-from .config import load_config
+from .config import get_index_path, load_config
 from .diff import generate_diff
 from .filters import is_excluded
+from .indexer import build_index, update_index
 from .ollama_client import OllamaClient
 from .parser import (
     AssistantBlock,
@@ -33,6 +44,7 @@ from .prompts import (
     build_metadata_prompt,
     parse_ollama_response,
 )
+from .search import search as fts_search
 
 console = Console()
 
@@ -208,3 +220,171 @@ def metadata(file_path: str, yes: bool, config_path: str | None) -> None:
     updated = update_note(content, new_block)
     diff = generate_diff(content, updated, path.name)
     _show_and_confirm(diff, path, updated, yes)
+
+
+# ---------------------------------------------------------------------------
+# Shared index options
+# ---------------------------------------------------------------------------
+
+_config_option = click.option(
+    "--config",
+    "-c",
+    "config_path",
+    default=None,
+    type=click.Path(exists=True),
+    help="Path to a YAML config file (default: config.yml in cwd).",
+)
+
+_index_path_option = click.option(
+    "--index-path",
+    "index_path_override",
+    default=None,
+    type=click.Path(),
+    help=(
+        "Path to the SQLite index file. "
+        "Overrides config and the platform default."
+    ),
+)
+
+
+def _resolve_index_path(cfg, index_path_override: str | None) -> Path:
+    if index_path_override:
+        return Path(index_path_override)
+    return get_index_path(cfg)
+
+
+# ---------------------------------------------------------------------------
+# Index command group
+# ---------------------------------------------------------------------------
+
+
+@main.group()
+def index() -> None:
+    """Build and update the full-text search index."""
+
+
+@index.command("build")
+@_config_option
+@_index_path_option
+def index_build(config_path: str | None, index_path_override: str | None) -> None:
+    """Full rebuild of the index from scratch."""
+    cfg = load_config(Path(config_path) if config_path else None)
+
+    if not cfg.vault_root:
+        console.print(
+            "[red]Error:[/red] vault_root is not set. "
+            "Add it to your config.yml or set --config."
+        )
+        sys.exit(1)
+
+    vault_root = Path(cfg.vault_root)
+    if not vault_root.is_dir():
+        console.print(f"[red]Error:[/red] vault_root does not exist: {vault_root}")
+        sys.exit(1)
+
+    idx_path = _resolve_index_path(cfg, index_path_override)
+    console.print(f"[cyan]Building index:[/cyan] {idx_path}")
+    console.print(f"[dim]Vault: {vault_root}[/dim]")
+
+    with console.status("[yellow]Indexing…[/yellow]"):
+        indexed, skipped = build_index(vault_root, idx_path, cfg)
+
+    console.print(
+        f"[green]✓ Done.[/green] Indexed: [bold]{indexed}[/bold]"
+        + (f"  Skipped (read errors): {skipped}" if skipped else "")
+    )
+
+
+@index.command("update")
+@_config_option
+@_index_path_option
+def index_update(config_path: str | None, index_path_override: str | None) -> None:
+    """Incremental update: re-index changed files, remove deleted ones."""
+    cfg = load_config(Path(config_path) if config_path else None)
+
+    if not cfg.vault_root:
+        console.print(
+            "[red]Error:[/red] vault_root is not set. "
+            "Add it to your config.yml or set --config."
+        )
+        sys.exit(1)
+
+    vault_root = Path(cfg.vault_root)
+    if not vault_root.is_dir():
+        console.print(f"[red]Error:[/red] vault_root does not exist: {vault_root}")
+        sys.exit(1)
+
+    idx_path = _resolve_index_path(cfg, index_path_override)
+    console.print(f"[cyan]Updating index:[/cyan] {idx_path}")
+    console.print(f"[dim]Vault: {vault_root}[/dim]")
+
+    with console.status("[yellow]Scanning for changes…[/yellow]"):
+        added_or_updated, deleted, skipped = update_index(vault_root, idx_path, cfg)
+
+    parts = [f"Updated: [bold]{added_or_updated}[/bold]"]
+    if deleted:
+        parts.append(f"Removed: {deleted}")
+    if skipped:
+        parts.append(f"Skipped (read errors): {skipped}")
+    console.print("[green]✓ Done.[/green]  " + "  ".join(parts))
+
+
+# ---------------------------------------------------------------------------
+# Search command
+# ---------------------------------------------------------------------------
+
+
+@main.command()
+@click.argument("query")
+@_config_option
+@_index_path_option
+@click.option(
+    "--limit",
+    "-n",
+    default=20,
+    show_default=True,
+    help="Maximum number of results.",
+)
+def search(
+    query: str,
+    config_path: str | None,
+    index_path_override: str | None,
+    limit: int,
+) -> None:
+    """Full-text search across indexed notes.
+
+    QUERY is a plain-text search expression (FTS5 syntax is also supported).
+    """
+    cfg = load_config(Path(config_path) if config_path else None)
+    idx_path = _resolve_index_path(cfg, index_path_override)
+
+    if not idx_path.exists():
+        console.print(
+            f"[red]Error:[/red] Index not found at {idx_path}. "
+            "Run [bold]obsassist index build[/bold] first."
+        )
+        sys.exit(1)
+
+    results = fts_search(idx_path, query, limit=limit)
+
+    if not results:
+        console.print("[yellow]No results found.[/yellow]")
+        return
+
+    table = Table(show_header=True, header_style="bold cyan", box=None, padding=(0, 1))
+    table.add_column("#", style="dim", width=3, no_wrap=True)
+    table.add_column("File", style="green", no_wrap=False)
+    table.add_column("Title", no_wrap=False)
+    table.add_column("Snippet", style="dim", no_wrap=False)
+
+    for i, result in enumerate(results, 1):
+        table.add_row(
+            str(i),
+            result.path,
+            result.title,
+            result.snippet,
+        )
+
+    console.print(table)
+    console.print(f"\n[dim]{len(results)} result(s) for:[/dim] {query}")
+
