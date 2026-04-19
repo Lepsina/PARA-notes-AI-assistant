@@ -1,6 +1,8 @@
 """Configuration loading for obsassist."""
 from __future__ import annotations
 
+import os
+import platform
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -46,6 +48,8 @@ class Config:
         }
     )
     date_format: str = "%Y-%m-%d"
+    # Leave empty to use the platform default (see get_index_path()).
+    index_path: str = ""
     ollama: OllamaConfig = field(default_factory=OllamaConfig)
     assistant_block: AssistantBlockConfig = field(default_factory=AssistantBlockConfig)
 
@@ -86,6 +90,8 @@ def _parse_config(data: dict[str, Any]) -> Config:
         cfg.path_priority = {k: float(v) for k, v in data["path_priority"].items()}
     if "date_format" in data:
         cfg.date_format = str(data["date_format"])
+    if "index_path" in data:
+        cfg.index_path = str(data["index_path"])
 
     if "ollama" in data:
         od = data["ollama"]
@@ -105,3 +111,28 @@ def _parse_config(data: dict[str, Any]) -> Config:
         )
 
     return cfg
+
+
+def get_index_path(cfg: Config) -> Path:
+    """Return the resolved path to the SQLite index file.
+
+    Priority:
+    1. ``cfg.index_path`` if explicitly set (config file or CLI flag).
+    2. ``%LOCALAPPDATA%\\obsassist\\index.sqlite`` on Windows.
+    3. ``$XDG_DATA_HOME/obsassist/index.sqlite`` (or
+       ``~/.local/share/obsassist/index.sqlite``) on Linux/macOS.
+    """
+    if cfg.index_path:
+        return Path(cfg.index_path)
+
+    if platform.system() == "Windows":
+        local_app_data = os.environ.get("LOCALAPPDATA", "")
+        if local_app_data:
+            base = Path(local_app_data)
+        else:
+            base = Path.home() / "AppData" / "Local"
+    else:
+        xdg = os.environ.get("XDG_DATA_HOME", "")
+        base = Path(xdg) if xdg else Path.home() / ".local" / "share"
+
+    return base / "obsassist" / "index.sqlite"

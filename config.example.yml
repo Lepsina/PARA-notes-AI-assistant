@@ -25,6 +25,12 @@ path_priority:
 # Date format used in notes and filenames
 date_format: "%Y-%m-%d"
 
+# Path to the SQLite full-text search index file.
+# Leave commented out to use the platform default:
+#   Windows: %LOCALAPPDATA%\obsassist\index.sqlite
+#   Linux/macOS: ~/.local/share/obsassist/index.sqlite
+# index_path: "C:/Users/YOUR_USERNAME/AppData/Local/obsassist/index.sqlite"
+
 # Ollama server settings
 ollama:
   base_url: "http://localhost:11434"
