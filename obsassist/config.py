@@ -12,9 +12,19 @@ import yaml
 
 @dataclass
 class OllamaConfig:
-    base_url: str = "http://localhost:11434"
+    base_url: str = "http://127.0.0.1:11434"
     model: str = "llama3:8b"
     temperature: float = 0.2
+
+
+@dataclass
+class EmbeddingsConfig:
+    provider: str = "ollama"
+    base_url: str = "http://127.0.0.1:11434"
+    model: str = "nomic-embed-text"
+    batch_size: int = 32
+    chunk_size: int = 1000
+    chunk_overlap: int = 200
 
 
 @dataclass
@@ -52,6 +62,7 @@ class Config:
     index_path: str = ""
     ollama: OllamaConfig = field(default_factory=OllamaConfig)
     assistant_block: AssistantBlockConfig = field(default_factory=AssistantBlockConfig)
+    embeddings: EmbeddingsConfig = field(default_factory=EmbeddingsConfig)
 
 
 def load_config(config_path: Path | None = None) -> Config:
@@ -96,7 +107,7 @@ def _parse_config(data: dict[str, Any]) -> Config:
     if "ollama" in data:
         od = data["ollama"]
         cfg.ollama = OllamaConfig(
-            base_url=str(od.get("base_url", "http://localhost:11434")),
+            base_url=str(od.get("base_url", "http://127.0.0.1:11434")),
             model=str(od.get("model", "llama3:8b")),
             temperature=float(od.get("temperature", 0.2)),
         )
@@ -108,6 +119,17 @@ def _parse_config(data: dict[str, Any]) -> Config:
             sections=list(
                 abd.get("sections", ["Summary", "Questions", "Metadata suggestions"])
             ),
+        )
+
+    if "embeddings" in data:
+        ed = data["embeddings"]
+        cfg.embeddings = EmbeddingsConfig(
+            provider=str(ed.get("provider", "ollama")),
+            base_url=str(ed.get("base_url", "http://127.0.0.1:11434")),
+            model=str(ed.get("model", "nomic-embed-text")),
+            batch_size=int(ed.get("batch_size", 32)),
+            chunk_size=int(ed.get("chunk_size", 1000)),
+            chunk_overlap=int(ed.get("chunk_overlap", 200)),
         )
 
     return cfg

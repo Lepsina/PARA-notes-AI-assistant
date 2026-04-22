@@ -31,9 +31,9 @@ date_format: "%Y-%m-%d"
 #   Linux/macOS: ~/.local/share/obsassist/index.sqlite
 # index_path: "C:/Users/YOUR_USERNAME/AppData/Local/obsassist/index.sqlite"
 
-# Ollama server settings
+# Ollama server settings (for analyze/metadata/ask commands)
 ollama:
-  base_url: "http://localhost:11434"
+  base_url: "http://127.0.0.1:11434"
   model: "llama3:8b"
   temperature: 0.2
 
@@ -44,3 +44,12 @@ assistant_block:
     - Summary
     - Questions
     - "Metadata suggestions"
+
+# Embeddings settings (for embeddings build/update and ask --mode vector/hybrid)
+embeddings:
+  provider: ollama
+  base_url: "http://127.0.0.1:11434"
+  model: "nomic-embed-text"   # pull with: ollama pull nomic-embed-text
+  batch_size: 32              # chunks embedded per Ollama call batch
+  chunk_size: 1000            # max characters per chunk
+  chunk_overlap: 200          # overlap characters between adjacent chunks

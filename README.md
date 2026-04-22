@@ -23,8 +23,9 @@ The block is inserted at the end of the note on the first run and updated in-pla
 subsequent run — no other content is touched.  Before writing, the tool shows a colour diff and
 asks for confirmation (pass `--yes` to skip).
 
-It also provides a **full-text search index** powered by SQLite FTS5 so you can search across your
-entire vault from the command line without touching Obsidian.
+It also provides a **full-text search index** powered by SQLite FTS5, **semantic embeddings**
+powered by Ollama (`nomic-embed-text`), and an **`ask`** command that answers natural-language
+questions about your vault using hybrid retrieval (FTS + vector reranking).
 
 ---
 
@@ -33,8 +34,9 @@ entire vault from the command line without touching Obsidian.
 | Dependency | Version |
 |---|---|
 | Python | ≥ 3.11 |
-| [Ollama](https://ollama.com/download) | any recent version (for analyze/metadata) |
-| Model | `llama3:8b` (or change in config) |
+| [Ollama](https://ollama.com/download) | any recent version |
+| LLM model | `llama3:8b` (or change in config) |
+| Embedding model | `nomic-embed-text` (for embeddings / ask) |
 
 > The indexing and search commands require **no additional dependencies** beyond the base install —
 > SQLite FTS5 is bundled with Python's standard library.
@@ -58,6 +60,10 @@ pip install -e .
 # 4. Copy the sample config into your vault
 copy config.example.yml "C:\Users\YOUR_USERNAME\Documents\Obsidian Vault\Assistant\config.yml"
 # Edit the copy to set vault_root and adjust any settings.
+
+# 5. Pull Ollama models
+ollama pull llama3:8b          # for analyze / metadata / ask (generation)
+ollama pull nomic-embed-text   # for embeddings / ask (retrieval)
 ```
 
 After installation the `obsassist` command is available in your activated virtual environment.
@@ -82,9 +88,16 @@ exclude_paths:
 # index_path: "C:/Users/YOUR_USERNAME/AppData/Local/obsassist/index.sqlite"
 
 ollama:
-  base_url: "http://localhost:11434"
+  base_url: "http://127.0.0.1:11434"
   model: "llama3:8b"
   temperature: 0.2
+
+embeddings:
+  base_url: "http://127.0.0.1:11434"
+  model: "nomic-embed-text"
+  chunk_size: 1000      # max characters per chunk
+  chunk_overlap: 200    # overlap between adjacent chunks
+  batch_size: 32
 ```
 
 All fields are optional — the tool falls back to sensible defaults.
@@ -93,7 +106,7 @@ All fields are optional — the tool falls back to sensible defaults.
 
 ## Usage
 
-Make sure Ollama is running first (only needed for `analyze` / `metadata`):
+Make sure Ollama is running first:
 
 ```powershell
 ollama serve           # in a separate terminal
@@ -183,6 +196,84 @@ obsassist search "query"  --index-path D:\my-index.sqlite
 
 ---
 
+## Semantic Embeddings
+
+The embeddings index stores text chunks and their vector representations, enabling semantic
+(meaning-based) search that goes beyond keyword matching.
+
+### Setup
+
+```powershell
+ollama pull nomic-embed-text   # one-time download (~270 MB)
+```
+
+### Build the embeddings index (full rebuild)
+
+```powershell
+obsassist embeddings build --config "C:\path\to\config.yml"
+```
+
+This chunks all vault notes and embeds them with `nomic-embed-text`.
+
+### Update the embeddings index (incremental)
+
+```powershell
+obsassist embeddings update --config "C:\path\to\config.yml"
+```
+
+Only files whose content has changed are re-chunked and re-embedded.
+
+---
+
+## Ask Command
+
+Answer natural-language questions about your vault with cited sources.
+
+```powershell
+obsassist ask "Какие у меня цели на этот квартал?" --config "C:\path\to\config.yml"
+obsassist ask "What projects am I working on?" --mode fts
+obsassist ask "Tell me about my fitness notes" --mode vector --k 8
+```
+
+### Retrieval modes
+
+| Mode | Description |
+|---|---|
+| `hybrid` (default) | FTS gathers candidates, then reranks by vector similarity |
+| `fts` | Full-text search only (no embedding model required) |
+| `vector` | Pure cosine similarity over all chunk embeddings |
+
+### Options
+
+| Flag | Default | Description |
+|---|---|---|
+| `--mode` | `hybrid` | Retrieval strategy |
+| `--k` | `12` | Number of chunks to include in the LLM context |
+| `--candidates` | `50` | FTS candidate pool size for hybrid mode |
+| `--save-to` | — | Save the answer as a Markdown file |
+
+### Example output
+
+```
+Analyzing: "Какие у меня цели на этот квартал?"  mode=hybrid  chunks=8  model=llama3:8b
+
+В этом квартале ваши основные цели…
+
+---
+
+**Sources**
+
+- Projects/Q2-goals.md — Goals Overview
+- Daily/2026-04-01.md — Weekly review
+```
+
+### Prerequisites for ask
+
+- `fts` mode: run `obsassist index build` first.
+- `vector` / `hybrid` mode: run both `obsassist index build` **and** `obsassist embeddings build`.
+
+---
+
 ## Obsidian integration (Shell Commands plugin)
 
 Install the [Shell Commands](https://github.com/Taitava/obsidian-shellcommands) community plugin,
@@ -201,6 +292,42 @@ Assign a hotkey (e.g. `Ctrl+Shift+A`) to trigger the analysis from inside Obsidi
 
 ---
 
+## Troubleshooting
+
+### Ollama not reachable on Windows / PowerShell
+
+If `obsassist` reports "Cannot reach Ollama" but `ollama serve` is running:
+
+```powershell
+# 1. Clear proxy environment variables that may interfere
+Remove-Item Env:HTTP_PROXY  -ErrorAction SilentlyContinue
+Remove-Item Env:HTTPS_PROXY -ErrorAction SilentlyContinue
+Remove-Item Env:ALL_PROXY   -ErrorAction SilentlyContinue
+$env:NO_PROXY = "127.0.0.1,localhost"
+
+# 2. Force 127.0.0.1 (avoids IPv6 localhost resolution)
+$env:OLLAMA_BASE_URL = "http://127.0.0.1:11434"
+
+# 3. Verify Ollama is actually responding
+Invoke-RestMethod -Uri "http://127.0.0.1:11434/api/tags"
+
+# 4. Re-run your command
+obsassist analyze --file note.md --config config.yml
+```
+
+The config default is already `http://127.0.0.1:11434`.  If you previously had
+`http://localhost:11434` in your `config.yml`, update it to `127.0.0.1`.
+
+### Embedding model not available
+
+```powershell
+ollama pull nomic-embed-text
+```
+
+If `embeddings build` is slow, reduce `batch_size` in config (default: 32).
+
+---
+
 ## Project structure
 
 ```
@@ -208,21 +335,28 @@ PARA-notes-AI-assistant/
 ├── pyproject.toml          # build config, dependencies, obsassist entrypoint
 ├── config.example.yml      # sample configuration (copy to vault)
 ├── obsassist/
-│   ├── cli.py              # Click commands: analyze, metadata, index, search
-│   ├── config.py           # YAML config loading + get_index_path()
+│   ├── cli.py              # Click commands: analyze, metadata, index, search, embeddings, ask
+│   ├── config.py           # YAML config loading + EmbeddingsConfig + get_index_path()
 │   ├── indexer.py          # SQLite FTS5 index build/update + metadata extraction
 │   ├── search.py           # Full-text search over the FTS5 index
+│   ├── chunker.py          # Markdown-aware text chunker (heading + size split)
+│   ├── embeddings.py       # Embeddings pipeline (chunks + vectors tables)
+│   ├── retrieval.py        # FTS / vector / hybrid retrieval strategies
 │   ├── parser.py           # ## Assistant block insert/update/parse
 │   ├── filters.py          # exclude-path logic
 │   ├── diff.py             # unified diff generation
-│   ├── ollama_client.py    # HTTP wrapper for Ollama /api/generate
+│   ├── ollama_client.py    # HTTP wrapper for Ollama /api/generate + /api/embeddings
 │   └── prompts.py          # prompt templates + response parser
 └── tests/
     ├── test_parser.py
     ├── test_filters.py
     ├── test_diff.py
     ├── test_indexer.py
-    └── test_search.py
+    ├── test_search.py
+    ├── test_chunker.py
+    ├── test_embeddings.py
+    ├── test_retrieval.py
+    └── test_ask_cmd.py
 ```
 
 ---
@@ -249,3 +383,4 @@ The following vault directories are **never** read or modified by any command:
 | `.obsidian/` | Obsidian internal config |
 
 `Archive/` is **allowed** but has a lower priority weighting for future batch processing.
+

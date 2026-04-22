@@ -36,6 +36,7 @@ _ANALYZE_TEMPLATE = """\
 - Questions: открытые вопросы, несостыковки, что стоит исследовать дальше.
 - Metadata: tags (список), topic, status (draft/in-progress/complete), \
 category (Buffer/Projects/Areas/Resources/Archive/Daily), related_topics (список).
+- Отвечай на том же языке, что и заметка. Если язык смешанный — используй русский.
 
 ---
 Заметка:
@@ -66,9 +67,25 @@ _METADATA_TEMPLATE = """\
 - category: Buffer | Projects | Areas | Resources | Archive | Daily
 - related_topics: список связанных тем
 
+Отвечай на том же языке, что и заметка. Если язык смешанный — используй русский.
+
 ---
 Заметка:
 {note_content}
+"""
+
+
+_ASK_TEMPLATE = """\
+Ты — ИИ-ассистент, отвечающий на вопросы по личной базе знаний (Obsidian vault).
+
+Используй только приведённый ниже контекст. Если ответа нет в контексте — честно скажи об этом.
+Отвечай на том же языке, что и вопрос пользователя. Если вопрос на русском — отвечай на русском.
+
+Контекст:
+{context}
+
+---
+Вопрос: {question}
 """
 
 
@@ -80,6 +97,11 @@ def build_analyze_prompt(note_content: str) -> str:
 def build_metadata_prompt(note_content: str) -> str:
     """Return a metadata-only prompt for *note_content*."""
     return _METADATA_TEMPLATE.format(note_content=note_content)
+
+
+def build_ask_prompt(context: str, question: str) -> str:
+    """Return a RAG-style prompt with *context* chunks and a *question*."""
+    return _ASK_TEMPLATE.format(context=context, question=question)
 
 
 # ---------------------------------------------------------------------------
