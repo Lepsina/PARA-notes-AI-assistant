@@ -1,0 +1,113 @@
+# Vocabulary file for obsassist metadata normalisation.
+# Path: Assistant/metadata.vocab.yml
+#
+# Configure the path to this file in your config.yml:
+#   metadata:
+#     vocab_path: "C:/Users/YOUR_USERNAME/Documents/Obsidian Vault/Assistant/metadata.vocab.yml"
+#
+# Sections
+# --------
+# topics_allowed   – canonical topic identifiers accepted in the `topics` field.
+# normalize_topics – map from raw tag/topic → canonical topic.
+# priority_from_tags – map from tag → priority value.
+# workflow_from_tags – map from tag → workflow label (stored in `tags`, informational).
+
+version: 1
+lang_default: ru
+
+tags:
+  preserve_original: true
+  lowercase: true
+
+topics_allowed:
+  - math
+  - algebra
+  - geometry
+  - linear-algebra
+  - calculus
+  - differential-calculus
+  - integral-calculus
+  - discrete-math
+  - set-theory
+  - number-theory
+  - algorithms
+  - graph-algorithms
+  - strings
+  - physics
+  - mechanics
+  - electrostatics
+  - cs
+  - devops
+  - golang
+  - blockchain
+  - ydb
+  - health
+  - meditation
+  - creativity
+  - reflection
+  - philosophy
+  - books
+  - films
+  - sewing
+  - music
+  - plans
+  - experiments
+  - excalidraw
+
+normalize_topics:
+  # Mathematics
+  матан: calculus
+  дифференциальное_исчисление: differential-calculus
+  неопределенный_интеграл: integral-calculus
+  тейлор: calculus
+  алгебра: algebra
+  геометрия: geometry
+  линал: linear-algebra
+  матрицы: linear-algebra
+  операторы: linear-algebra
+  дискра: discrete-math
+  теория_множеств: set-theory
+  теория_чисел: number-theory
+  number_theory_algo: number-theory
+  # Algorithms / CS
+  алгоритмы: algorithms
+  bfs: graph-algorithms
+  dfs: graph-algorithms
+  dsu: graph-algorithms
+  scanline: algorithms
+  строки: strings
+  # Physics
+  физика: physics
+  механика: mechanics
+  электростатика: electrostatics
+  # Life / Personal
+  здоровье: health
+  медитация: meditation
+  творчество: creativity
+  рефлексия: reflection
+  философия: philosophy
+  книги: books
+  фильмы: films
+  шитье: sewing
+  музыка: music
+  планы: plans
+  опыты: experiments
+  # Tech
+  excalidraw: excalidraw
+  devops: devops
+  golang: golang
+  blockchain: blockchain
+  ydb: ydb
+
+priority_from_tags:
+  high: high
+  medium: medium
+  low: low
+
+workflow_from_tags:
+  дописать: todo
+  просмотреть: review
+  deferred_projects: deferred
+  ошибка_новичка: pitfalls
+  экз_тч: exam
+  2_указателя: two-pointers

@@ -45,6 +45,7 @@ from .diff import generate_diff
 from .embeddings import build_embeddings, update_embeddings
 from .filters import is_excluded
 from .indexer import build_index, update_index
+from .metadata_guard import ALLOWED_KEYS, apply_metadata_to_content, load_vocab
 from .ollama_client import OllamaClient
 from .parser import (
     AssistantBlock,
@@ -55,6 +56,7 @@ from .parser import (
 from .prompts import (
     build_analyze_prompt,
     build_ask_prompt,
+    build_frontmatter_prompt,
     build_metadata_prompt,
     parse_ollama_response,
 )
@@ -205,13 +207,32 @@ def analyze(file_path: str, yes: bool, config_path: str | None) -> None:
     type=click.Path(exists=True),
     help="Path to a YAML config file (default: config.yml in cwd).",
 )
-def metadata(file_path: str, yes: bool, config_path: str | None) -> None:
-    """Generate metadata suggestions for a note (preserves existing Summary/Questions)."""
+@click.option(
+    "--force",
+    is_flag=True,
+    default=False,
+    help="Overwrite existing frontmatter fields (full regeneration).",
+)
+def metadata(file_path: str, yes: bool, config_path: str | None, force: bool) -> None:
+    """Update YAML frontmatter metadata only — body content is never modified.
+
+    LLM suggestions are validated against a strict schema allowlist before
+    writing.  Unknown keys are silently dropped.  Existing user-authored
+    values are preserved unless --force is used.
+    """
     cfg = load_config(Path(config_path) if config_path else None)
     path, content = _load_note(file_path)
     _check_exclusion(path, cfg)
 
-    client = _build_client(cfg)
+    # Determine which model to use: dedicated metadata model → fallback to ask
+    metadata_model = cfg.metadata.model or cfg.ollama.model
+    effective_force = force or cfg.metadata.force
+
+    client = OllamaClient(
+        base_url=cfg.ollama.base_url,
+        model=metadata_model,
+        temperature=cfg.ollama.temperature,
+    )
     if not client.health_check():
         console.print(
             f"[red]Error:[/red] Cannot reach Ollama at [bold]{cfg.ollama.base_url}[/bold].\n"
@@ -219,25 +240,37 @@ def metadata(file_path: str, yes: bool, config_path: str | None) -> None:
         )
         sys.exit(1)
 
-    console.print(f"[cyan]Generating metadata for:[/cyan] {path.name}  "
-                  f"[dim]model={cfg.ollama.model}[/dim]")
+    # Load vocab for normalisation
+    vocab = load_vocab(cfg.metadata.vocab_path) if cfg.metadata.vocab_path else None
+
+    # Build the effective allowed-keys set
+    allowed = set(ALLOWED_KEYS) | set(cfg.metadata.extra_allowed_keys)
+
+    console.print(
+        f"[cyan]Updating metadata for:[/cyan] {path.name}  "
+        f"[dim]model={metadata_model}[/dim]"
+    )
 
     with console.status("[yellow]Calling Ollama…[/yellow]"):
-        response = client.generate(build_metadata_prompt(content))
+        response = client.generate(build_frontmatter_prompt(content))
 
-    new_block = parse_ollama_response(response)
-
-    # Preserve existing Summary and Questions if a block is already present.
-    pos = find_assistant_section(content)
-    if pos is not None:
-        existing = parse_existing_block(content[pos[0] : pos[1]])
-        new_block = AssistantBlock(
-            summary=existing.summary,
-            questions=existing.questions,
-            metadata_yaml=new_block.metadata_yaml,
+    try:
+        updated, changed = apply_metadata_to_content(
+            content,
+            response,
+            allowed_keys=allowed,
+            vocab=vocab,
+            force=effective_force,
         )
+    except ValueError as exc:
+        console.print(f"[red]Metadata validation error:[/red] {exc}")
+        console.print("[yellow]No changes written — note is unchanged.[/yellow]")
+        return
 
-    updated = update_note(content, new_block)
+    if not changed:
+        console.print("[green]No changes needed.[/green]")
+        return
+
     diff = generate_diff(content, updated, path.name)
     _show_and_confirm(diff, path, updated, yes)
 

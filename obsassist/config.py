@@ -28,6 +28,21 @@ class EmbeddingsConfig:
 
 
 @dataclass
+class MetadataConfig:
+    """Settings specific to the ``metadata`` command."""
+
+    # Model override: when non-empty, used instead of ``ollama.model``.
+    model: str = ""
+    # Path to an external vocabulary YAML file (e.g. Assistant/metadata.vocab.yml).
+    vocab_path: str = ""
+    # Extra allowed frontmatter keys beyond the built-in schema allowlist.
+    # An empty list means "use only the built-in allowlist".
+    extra_allowed_keys: list[str] = field(default_factory=list)
+    # When True, ``metadata`` command overwrites existing user-authored values.
+    force: bool = False
+
+
+@dataclass
 class AssistantBlockConfig:
     heading: str = "## Assistant"
     sections: list[str] = field(
@@ -63,6 +78,7 @@ class Config:
     ollama: OllamaConfig = field(default_factory=OllamaConfig)
     assistant_block: AssistantBlockConfig = field(default_factory=AssistantBlockConfig)
     embeddings: EmbeddingsConfig = field(default_factory=EmbeddingsConfig)
+    metadata: MetadataConfig = field(default_factory=MetadataConfig)
 
 
 def load_config(config_path: Path | None = None) -> Config:
@@ -130,6 +146,15 @@ def _parse_config(data: dict[str, Any]) -> Config:
             batch_size=int(ed.get("batch_size", 32)),
             chunk_size=int(ed.get("chunk_size", 1000)),
             chunk_overlap=int(ed.get("chunk_overlap", 200)),
+        )
+
+    if "metadata" in data:
+        md = data["metadata"]
+        cfg.metadata = MetadataConfig(
+            model=str(md.get("model", "")),
+            vocab_path=str(md.get("vocab_path", "")),
+            extra_allowed_keys=list(md.get("extra_allowed_keys", [])),
+            force=bool(md.get("force", False)),
         )
 
     return cfg
