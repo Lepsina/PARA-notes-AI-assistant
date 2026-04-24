@@ -5,9 +5,15 @@ Commands
 obsassist analyze  --file <path> [--yes] [--config <path>]
     Full analysis: Summary + Questions + Metadata suggestions.
 
-obsassist metadata --file <path> [--yes] [--config <path>]
-    Metadata suggestions only (Summary / Questions are preserved when a
-    block already exists).
+obsassist metadata update --file <path> [--yes] [--config <path>]
+    Metadata suggestions only for a single note (Summary / Questions are
+    preserved when a block already exists).
+
+obsassist metadata apply --tag <tag> [--vault <path>] [--remove-tag]
+                         [--dry-run] [--diff] [--limit N] [--yes] [--force]
+                         [--config <path>]
+    Batch-apply metadata to all vault notes that contain the marker tag
+    (in frontmatter tags list or as an inline #tag in the body).
 
 obsassist index build [--config <path>] [--index-path <path>]
     Full rebuild of the full-text search index from scratch.
@@ -46,6 +52,7 @@ from .embeddings import build_embeddings, update_embeddings
 from .filters import is_excluded
 from .indexer import build_index, update_index
 from .metadata_guard import ALLOWED_KEYS, apply_metadata_to_content, load_vocab
+from .tag_scanner import has_marker_tag, remove_marker_tag
 from .ollama_client import OllamaClient
 from .parser import (
     AssistantBlock,
@@ -184,7 +191,17 @@ def analyze(file_path: str, yes: bool, config_path: str | None) -> None:
     _show_and_confirm(diff, path, updated, yes)
 
 
-@main.command()
+# ---------------------------------------------------------------------------
+# Metadata command group
+# ---------------------------------------------------------------------------
+
+
+@main.group()
+def metadata() -> None:
+    """Update YAML frontmatter metadata — body content is never modified."""
+
+
+@metadata.command("update")
 @click.option(
     "--file",
     "-f",
@@ -213,8 +230,8 @@ def analyze(file_path: str, yes: bool, config_path: str | None) -> None:
     default=False,
     help="Overwrite existing frontmatter fields (full regeneration).",
 )
-def metadata(file_path: str, yes: bool, config_path: str | None, force: bool) -> None:
-    """Update YAML frontmatter metadata only — body content is never modified.
+def metadata_update(file_path: str, yes: bool, config_path: str | None, force: bool) -> None:
+    """Update YAML frontmatter metadata for a single note.
 
     LLM suggestions are validated against a strict schema allowlist before
     writing.  Unknown keys are silently dropped.  Existing user-authored
@@ -273,6 +290,261 @@ def metadata(file_path: str, yes: bool, config_path: str | None, force: bool) ->
 
     diff = generate_diff(content, updated, path.name)
     _show_and_confirm(diff, path, updated, yes)
+
+
+@metadata.command("apply")
+@click.option(
+    "--tag",
+    "-t",
+    "marker_tag",
+    required=True,
+    help="Marker tag to look for (e.g. add-metadata).  Leading '#' is optional.",
+)
+@click.option(
+    "--remove-tag",
+    "remove_tag",
+    is_flag=True,
+    default=False,
+    help="Remove the marker tag from the note after a successful metadata update.",
+)
+@click.option(
+    "--dry-run",
+    "dry_run",
+    is_flag=True,
+    default=False,
+    help="Scan and show proposed changes without writing any files.",
+)
+@click.option(
+    "--diff",
+    "show_diff",
+    is_flag=True,
+    default=False,
+    help="Show a unified diff of proposed frontmatter changes.",
+)
+@click.option(
+    "--limit",
+    "-n",
+    default=0,
+    show_default=True,
+    help="Maximum number of notes to process (0 = no limit).",
+)
+@click.option(
+    "--yes",
+    "-y",
+    is_flag=True,
+    help="Auto-apply changes without per-file confirmation.",
+)
+@click.option(
+    "--config",
+    "-c",
+    "config_path",
+    default=None,
+    type=click.Path(exists=True),
+    help="Path to a YAML config file (default: config.yml in cwd).",
+)
+@click.option(
+    "--force",
+    is_flag=True,
+    default=False,
+    help="Overwrite existing frontmatter fields (full regeneration).",
+)
+def metadata_apply(
+    marker_tag: str,
+    remove_tag: bool,
+    dry_run: bool,
+    show_diff: bool,
+    limit: int,
+    yes: bool,
+    config_path: str | None,
+    force: bool,
+) -> None:
+    """Batch-apply metadata to notes marked with a tag.
+
+    Scans the vault for all Markdown notes that contain MARKER_TAG either in
+    their frontmatter ``tags`` list or as an inline ``#tag`` in the body.
+    For each matching note the LLM is called and metadata is updated using
+    the same strict guardrails as ``metadata update``.
+
+    Examples:
+
+    \b
+      # Preview changes without writing
+      obsassist metadata apply --tag add-metadata --dry-run --diff
+
+    \b
+      # Apply to all marked notes, auto-confirm, remove the marker afterwards
+      obsassist metadata apply --tag add-metadata --yes --remove-tag
+
+    \b
+      # Process at most 5 notes
+      obsassist metadata apply --tag add-metadata --limit 5
+    """
+    cfg = load_config(Path(config_path) if config_path else None)
+
+    if not cfg.vault_root:
+        console.print(
+            "[red]Error:[/red] vault_root is not set. "
+            "Add it to your config.yml or set --config."
+        )
+        sys.exit(1)
+
+    vault_root = Path(cfg.vault_root)
+    if not vault_root.is_dir():
+        console.print(f"[red]Error:[/red] vault_root does not exist: {vault_root}")
+        sys.exit(1)
+
+    # Determine model and effective options
+    metadata_model = cfg.metadata.model or cfg.ollama.model
+    effective_force = force or cfg.metadata.force
+
+    client = OllamaClient(
+        base_url=cfg.ollama.base_url,
+        model=metadata_model,
+        temperature=cfg.ollama.temperature,
+    )
+    if not client.health_check():
+        console.print(
+            f"[red]Error:[/red] Cannot reach Ollama at [bold]{cfg.ollama.base_url}[/bold].\n"
+            "Make sure Ollama is running: [bold]ollama serve[/bold]"
+        )
+        sys.exit(1)
+
+    vocab = load_vocab(cfg.metadata.vocab_path) if cfg.metadata.vocab_path else None
+    allowed = set(ALLOWED_KEYS) | set(cfg.metadata.extra_allowed_keys)
+    vault_root_resolved = vault_root.resolve()
+
+    # ------------------------------------------------------------------
+    # Scan vault for marked files
+    # ------------------------------------------------------------------
+    console.print(
+        f"[cyan]Scanning vault:[/cyan] {vault_root}  "
+        f"[dim]tag={marker_tag}[/dim]"
+    )
+
+    marked_files: list[Path] = []
+    with console.status("[yellow]Scanning…[/yellow]"):
+        for md_path in sorted(vault_root.rglob("*.md")):
+            if is_excluded(md_path.resolve(), vault_root_resolved, cfg.exclude_paths):
+                continue
+            try:
+                content = md_path.read_text(encoding="utf-8")
+            except OSError:
+                continue
+            if has_marker_tag(content, marker_tag):
+                marked_files.append(md_path)
+
+    if not marked_files:
+        console.print(f"[yellow]No notes found containing tag '{marker_tag}'.[/yellow]")
+        return
+
+    if limit and limit > 0:
+        marked_files = marked_files[:limit]
+
+    console.print(
+        f"[green]Found {len(marked_files)} note(s)[/green] "
+        f"containing tag '[bold]{marker_tag}[/bold]'."
+    )
+    if dry_run:
+        console.print("[dim]Dry-run — no files will be written.[/dim]")
+
+    # ------------------------------------------------------------------
+    # Process each marked file
+    # ------------------------------------------------------------------
+    n_processed = n_updated = n_skipped = n_errors = 0
+
+    for md_path in marked_files:
+        try:
+            content = md_path.read_text(encoding="utf-8")
+        except OSError as exc:
+            console.print(f"[red]Error reading {md_path.name}:[/red] {exc}")
+            n_errors += 1
+            continue
+
+        console.print(
+            f"\n[cyan]Processing:[/cyan] {md_path.name}  "
+            f"[dim]model={metadata_model}[/dim]"
+        )
+        n_processed += 1
+
+        # Call the LLM
+        with console.status("[yellow]Calling Ollama…[/yellow]"):
+            response = client.generate(build_frontmatter_prompt(content))
+
+        try:
+            new_content, changed = apply_metadata_to_content(
+                content,
+                response,
+                allowed_keys=allowed,
+                vocab=vocab,
+                force=effective_force,
+            )
+        except ValueError as exc:
+            console.print(f"[red]Metadata validation error:[/red] {exc}")
+            console.print("[yellow]No changes written — note is unchanged.[/yellow]")
+            n_errors += 1
+            continue
+
+        # Remove marker tag if requested (regardless of whether metadata changed)
+        if remove_tag:
+            stripped = remove_marker_tag(new_content, marker_tag)
+            if stripped != new_content:
+                new_content = stripped
+                changed = True
+
+        if not changed:
+            console.print("[green]  No changes needed.[/green]")
+            continue
+
+        # Show diff when requested or when prompting (so user can decide)
+        needs_diff = show_diff or (not yes and not dry_run)
+        if needs_diff:
+            diff_text = generate_diff(content, new_content, md_path.name)
+            if diff_text:
+                console.print("\n[bold]Proposed changes:[/bold]")
+                console.print(
+                    Syntax(diff_text, "diff", theme="monokai", line_numbers=False)
+                )
+
+        if dry_run:
+            console.print(
+                f"[dim]  (dry-run) Would update: {md_path.name}[/dim]"
+            )
+            n_updated += 1
+            continue
+
+        if yes:
+            md_path.write_text(new_content, encoding="utf-8")
+            console.print(f"[green]  ✓ Updated:[/green] {md_path.name}")
+            n_updated += 1
+        else:
+            if not needs_diff:
+                # diff not shown yet — show it before prompting
+                diff_text = generate_diff(content, new_content, md_path.name)
+                if diff_text:
+                    console.print("\n[bold]Proposed changes:[/bold]")
+                    console.print(
+                        Syntax(diff_text, "diff", theme="monokai", line_numbers=False)
+                    )
+            if click.confirm(f"\nApply changes to {md_path.name}?"):
+                md_path.write_text(new_content, encoding="utf-8")
+                console.print(f"[green]  ✓ Updated:[/green] {md_path.name}")
+                n_updated += 1
+            else:
+                console.print("[yellow]  Skipped.[/yellow]")
+                n_skipped += 1
+
+    # ------------------------------------------------------------------
+    # Summary
+    # ------------------------------------------------------------------
+    parts = [
+        f"Processed: [bold]{n_processed}[/bold]",
+        f"Updated: [bold]{n_updated}[/bold]",
+    ]
+    if n_skipped:
+        parts.append(f"Skipped: {n_skipped}")
+    if n_errors:
+        parts.append(f"Errors: {n_errors}")
+    console.print("\n[green]✓ Done.[/green]  " + "  ".join(parts))
 
 
 # ---------------------------------------------------------------------------
