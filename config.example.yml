@@ -31,13 +31,29 @@ date_format: "%Y-%m-%d"
 #   Linux/macOS: ~/.local/share/obsassist/index.sqlite
 # index_path: "C:/Users/YOUR_USERNAME/AppData/Local/obsassist/index.sqlite"
 
-# Ollama server settings (for analyze/metadata/ask commands)
+# Ollama server settings (for analyze / ask commands)
 ollama:
   base_url: "http://127.0.0.1:11434"
   model: "llama3:8b"
   temperature: 0.2
 
-# Assistant block settings (how the block is written into notes)
+# Strict metadata command settings
+# The metadata command updates ONLY the YAML frontmatter; the markdown body
+# is never modified.  LLM output is validated against the schema allowlist
+# before writing.
+metadata:
+  # Lightweight model dedicated to metadata tasks.
+  # Falls back to ollama.model when not set.
+  model: "qwen2.5:3b-instruct"
+  # Path to the vocabulary file for tag/topic normalisation.
+  # Leave commented out to skip normalisation.
+  vocab_path: "C:/Users/YOUR_USERNAME/Documents/Obsidian Vault/Assistant/metadata.vocab.yml"
+  # Extra frontmatter keys allowed in addition to the built-in schema.
+  # extra_allowed_keys: []
+  # When true, overwrite existing frontmatter values (full regeneration).
+  force: false
+
+# Assistant block settings (how the block is written into notes by `analyze`)
 assistant_block:
   heading: "## Assistant"
   sections:
@@ -53,3 +69,4 @@ embeddings:
   batch_size: 32              # chunks embedded per Ollama call batch
   chunk_size: 1000            # max characters per chunk
   chunk_overlap: 200          # overlap characters between adjacent chunks
+

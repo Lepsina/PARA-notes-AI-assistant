@@ -104,6 +104,53 @@ All fields are optional — the tool falls back to sensible defaults.
 
 ---
 
+### Metadata vocabulary file
+
+Create `Assistant/metadata.vocab.yml` in your vault (see the bundled example file) and
+reference it from `config.yml`:
+
+```yaml
+metadata:
+  vocab_path: "C:/Users/YOUR_USERNAME/Documents/Obsidian Vault/Assistant/metadata.vocab.yml"
+```
+
+The vocabulary file controls:
+
+* `topics_allowed` — canonical topic identifiers that are kept in the `topics` field.
+* `normalize_topics` — map from raw tags/topic strings to canonical topics
+  (e.g. `матан → calculus`, `bfs → graph-algorithms`).
+* `priority_from_tags` — extract `priority` from existing tags
+  (e.g. `#High → priority: high`).
+* `workflow_from_tags` — optional workflow label mapping (informational).
+
+A copy of the vocabulary file with the user's full tag set is bundled at
+`Assistant/metadata.vocab.yml`.
+
+---
+
+### Separate model for metadata
+
+You can use a smaller, faster model for the `metadata` command while keeping a larger model
+for `analyze` / `ask`:
+
+```yaml
+ollama:
+  model: "llama3:8b"      # used by analyze and ask
+
+metadata:
+  model: "qwen2.5:3b-instruct"  # used by metadata (falls back to ollama.model if blank)
+```
+
+Pull the metadata model once:
+
+```powershell
+ollama pull qwen2.5:3b-instruct
+```
+
+If `metadata.model` is not set or the model is unavailable, the command automatically
+falls back to `ollama.model`.
+
+
 ## Usage
 
 Make sure Ollama is running first:
@@ -119,13 +166,66 @@ ollama pull llama3:8b  # one-time download
 obsassist analyze --file "C:\Users\YOUR_USERNAME\Documents\Obsidian Vault\Areas\self-expression.md"
 ```
 
-### Update metadata suggestions only
+### Update metadata in YAML frontmatter (strict mode)
 
-Existing `### Summary` and `### Questions` content is preserved.
+The `metadata` command updates **only** the YAML frontmatter block at the top of the note.
+The markdown body is **never modified** — it remains byte-for-byte identical after the command.
 
 ```powershell
 obsassist metadata --file "C:\Users\YOUR_USERNAME\Documents\Obsidian Vault\Areas\self-expression.md"
 ```
+
+#### What it does
+
+1. Calls a lightweight LLM to suggest frontmatter fields.
+2. Validates the output against a strict **schema allowlist** (unknown keys are silently
+   dropped).
+3. Applies **conservative merge**: only missing / empty fields are filled; existing
+   user-authored values are preserved.
+4. Normalises values using an optional external **vocabulary file**
+   (`topics`, `priority`, status aliases).
+5. Shows a colour diff and asks for confirmation before writing.
+
+#### `--force` flag
+
+```powershell
+obsassist metadata --file note.md --force
+```
+
+Overwrites all existing frontmatter fields with the LLM suggestions (full regeneration).
+
+#### Allowed frontmatter keys
+
+| Key | Type | Notes |
+|---|---|---|
+| `title` | string | Note title |
+| `created` | string | Creation date (`YYYY-MM-DD`) |
+| `updated` | string | Last update date (auto-set on change) |
+| `type` | string | Note type |
+| `status` | string | `draft` \| `active` \| `done` |
+| `lang` | string | Language code |
+| `tags` | list | Original tags preserved |
+| `topics` | list | Canonical topics (normalised via vocab) |
+| `entities` | list | Named entities |
+| `summary` | string | One-line description |
+| `priority` | string | `high` \| `medium` \| `low` |
+| `source_type` | string | Source type |
+| `exclude_from_ai` | boolean | Skip in AI queries |
+| `aliases` | list | Note aliases |
+
+Keys **not** in this list are discarded unless added via `extra_allowed_keys` in config.
+
+#### Legacy aliases (automatically normalised)
+
+| Input key / value | Canonical output |
+|---|---|
+| `topic:` | `topics:` (list) |
+| `tag:` | `tags:` (list) |
+| `status: complete` | `status: done` |
+| `status: completed` | `status: done` |
+| `status: in_progress` | `status: active` |
+| `status: in-progress` | `status: active` |
+
 
 ### Skip confirmation prompt
 
@@ -334,9 +434,12 @@ If `embeddings build` is slow, reduce `batch_size` in config (default: 32).
 PARA-notes-AI-assistant/
 ├── pyproject.toml          # build config, dependencies, obsassist entrypoint
 ├── config.example.yml      # sample configuration (copy to vault)
+├── Assistant/
+│   └── metadata.vocab.yml  # vocabulary file for tag/topic normalisation
 ├── obsassist/
 │   ├── cli.py              # Click commands: analyze, metadata, index, search, embeddings, ask
-│   ├── config.py           # YAML config loading + EmbeddingsConfig + get_index_path()
+│   ├── config.py           # YAML config loading + MetadataConfig + EmbeddingsConfig + get_index_path()
+│   ├── metadata_guard.py   # Strict frontmatter guardrails: sanitize, merge, vocab, write
 │   ├── indexer.py          # SQLite FTS5 index build/update + metadata extraction
 │   ├── search.py           # Full-text search over the FTS5 index
 │   ├── chunker.py          # Markdown-aware text chunker (heading + size split)
@@ -348,6 +451,7 @@ PARA-notes-AI-assistant/
 │   ├── ollama_client.py    # HTTP wrapper for Ollama /api/generate + /api/embeddings
 │   └── prompts.py          # prompt templates + response parser
 └── tests/
+    ├── test_metadata_guard.py  # strict metadata guardrails (56 tests)
     ├── test_parser.py
     ├── test_filters.py
     ├── test_diff.py
