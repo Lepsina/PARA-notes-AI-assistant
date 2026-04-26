@@ -37,7 +37,9 @@ obsassist ask "<question>" [--mode fts|vector|hybrid] [--k N]
 """
 from __future__ import annotations
 
+import json
 import sys
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import click
@@ -135,6 +137,94 @@ def _show_and_confirm(diff: str, path: Path, updated: str, yes: bool) -> None:
 
     path.write_text(updated, encoding="utf-8")
     console.print(f"\n[green]✓ Updated:[/green] {path}")
+
+
+# ---------------------------------------------------------------------------
+# Metadata apply helpers
+# ---------------------------------------------------------------------------
+
+
+def _metadata_state_path(vault_root: Path) -> Path:
+    """Return the path to the metadata-apply state file."""
+    return vault_root / ".obsassist" / "metadata-apply-state.json"
+
+
+def _load_processed_set(state_path: Path, tag: str) -> set[str]:
+    """Return the set of already-processed absolute file paths for *tag*."""
+    if not state_path.exists():
+        return set()
+    try:
+        with open(state_path, encoding="utf-8") as fh:
+            data = json.load(fh)
+        if data.get("tag") == tag:
+            return set(data.get("processed", []))
+    except (json.JSONDecodeError, OSError):
+        pass
+    return set()
+
+
+def _save_processed_set(state_path: Path, tag: str, processed: set[str]) -> None:
+    """Persist the set of processed file paths to the state file."""
+    state_path.parent.mkdir(parents=True, exist_ok=True)
+    with open(state_path, "w", encoding="utf-8") as fh:
+        json.dump(
+            {"tag": tag, "processed": sorted(processed)},
+            fh,
+            indent=2,
+            ensure_ascii=False,
+        )
+
+
+def _write_file(path: Path, content: str, *, make_backup: bool = False) -> None:
+    """Write *content* to *path*, optionally creating a ``.bak`` copy first."""
+    if make_backup:
+        bak = path.with_suffix(path.suffix + ".bak")
+        bak.write_bytes(path.read_bytes())
+    path.write_text(content, encoding="utf-8")
+
+
+def _llm_process_file(
+    md_path: Path,
+    client: OllamaClient,
+    allowed: set[str],
+    vocab: dict | None,
+    effective_force: bool,
+    marker_tag: str,
+    do_remove_tag: bool,
+) -> tuple[str, str, bool, str | None]:
+    """Read a note, call the LLM, and compute new content.
+
+    Returns ``(original, new_content, changed, error)``.
+    *error* is ``None`` on success, or a short error description.
+    """
+    try:
+        original = md_path.read_text(encoding="utf-8")
+    except OSError as exc:
+        return "", "", False, f"read error: {exc}"
+
+    try:
+        response = client.generate(build_frontmatter_prompt(original))
+    except Exception as exc:  # noqa: BLE001
+        return original, original, False, f"LLM error: {exc}"
+
+    try:
+        new_content, changed = apply_metadata_to_content(
+            original,
+            response,
+            allowed_keys=allowed,
+            vocab=vocab,
+            force=effective_force,
+        )
+    except ValueError as exc:
+        return original, original, False, f"validation error: {exc}"
+
+    if do_remove_tag:
+        stripped = remove_marker_tag(new_content, marker_tag)
+        if stripped != new_content:
+            new_content = stripped
+            changed = True
+
+    return original, new_content, changed, None
 
 
 # ---------------------------------------------------------------------------
@@ -348,6 +438,47 @@ def metadata_update(file_path: str, yes: bool, config_path: str | None, force: b
     default=False,
     help="Overwrite existing frontmatter fields (full regeneration).",
 )
+@click.option(
+    "--batch",
+    "--batch-size",
+    "batch_size",
+    default=0,
+    show_default=True,
+    help="Print a progress line after every N files (0 = disabled).",
+)
+@click.option(
+    "--workers",
+    "-w",
+    default=1,
+    show_default=True,
+    help=(
+        "Number of parallel LLM workers.  "
+        "Requires --yes or --dry-run; interactive mode falls back to 1."
+    ),
+)
+@click.option(
+    "--path",
+    "scope_path",
+    default=None,
+    type=click.Path(),
+    help="Restrict the scan to this sub-path within the vault.",
+)
+@click.option(
+    "--resume",
+    "resume",
+    is_flag=True,
+    default=False,
+    help=(
+        "Skip files already processed in a previous run "
+        "(state stored in <vault>/.obsassist/metadata-apply-state.json)."
+    ),
+)
+@click.option(
+    "--backup/--no-backup",
+    "backup",
+    default=True,
+    help="Create a .bak copy before overwriting each note (default: on).",
+)
 def metadata_apply(
     marker_tag: str,
     remove_tag: bool,
@@ -357,6 +488,11 @@ def metadata_apply(
     yes: bool,
     config_path: str | None,
     force: bool,
+    batch_size: int,
+    workers: int,
+    scope_path: str | None,
+    resume: bool,
+    backup: bool,
 ) -> None:
     """Batch-apply metadata to notes marked with a tag.
 
@@ -378,6 +514,10 @@ def metadata_apply(
     \b
       # Process at most 5 notes
       obsassist metadata apply --tag add-metadata --limit 5
+
+    \b
+      # Resume a previously interrupted batch
+      obsassist metadata apply --tag add-metadata --yes --resume
     """
     cfg = load_config(Path(config_path) if config_path else None)
 
@@ -392,6 +532,18 @@ def metadata_apply(
     if not vault_root.is_dir():
         console.print(f"[red]Error:[/red] vault_root does not exist: {vault_root}")
         sys.exit(1)
+
+    # Resolve scan root (optional sub-path restriction)
+    if scope_path:
+        scan_root = vault_root / scope_path
+        if not scan_root.is_dir():
+            console.print(
+                f"[red]Error:[/red] --path '{scope_path}' does not exist "
+                f"inside vault_root: {vault_root}"
+            )
+            sys.exit(1)
+    else:
+        scan_root = vault_root
 
     # Determine model and effective options
     metadata_model = cfg.metadata.model or cfg.ollama.model
@@ -413,17 +565,34 @@ def metadata_apply(
     allowed = set(ALLOWED_KEYS) | set(cfg.metadata.extra_allowed_keys)
     vault_root_resolved = vault_root.resolve()
 
+    # Interactive mode is incompatible with workers > 1
+    effective_workers = workers
+    if effective_workers > 1 and not (yes or dry_run):
+        console.print(
+            "[yellow]Warning:[/yellow] --workers > 1 requires --yes or --dry-run; "
+            "falling back to sequential processing."
+        )
+        effective_workers = 1
+
+    # ------------------------------------------------------------------
+    # Load resume state
+    # ------------------------------------------------------------------
+    state_file = _metadata_state_path(vault_root)
+    processed_set: set[str] = (
+        _load_processed_set(state_file, marker_tag) if resume else set()
+    )
+
     # ------------------------------------------------------------------
     # Scan vault for marked files
     # ------------------------------------------------------------------
     console.print(
-        f"[cyan]Scanning vault:[/cyan] {vault_root}  "
+        f"[cyan]Scanning vault:[/cyan] {scan_root}  "
         f"[dim]tag={marker_tag}[/dim]"
     )
 
-    marked_files: list[Path] = []
+    discovered: list[Path] = []
     with console.status("[yellow]Scanning…[/yellow]"):
-        for md_path in sorted(vault_root.rglob("*.md")):
+        for md_path in sorted(scan_root.rglob("*.md")):
             if is_excluded(md_path.resolve(), vault_root_resolved, cfg.exclude_paths):
                 continue
             try:
@@ -431,120 +600,156 @@ def metadata_apply(
             except OSError:
                 continue
             if has_marker_tag(content, marker_tag):
-                marked_files.append(md_path)
+                discovered.append(md_path)
 
-    if not marked_files:
+    n_discovered = len(discovered)
+    if not discovered:
         console.print(f"[yellow]No notes found containing tag '{marker_tag}'.[/yellow]")
         return
 
-    if limit and limit > 0:
-        marked_files = marked_files[:limit]
+    # Apply --limit before resume filtering
+    selected = discovered[:limit] if limit and limit > 0 else list(discovered)
+    n_selected = len(selected)
+
+    # Skip already-processed files when resuming
+    if resume and processed_set:
+        selected = [p for p in selected if str(p.resolve()) not in processed_set]
+        n_skipped_resume = n_selected - len(selected)
+        if n_skipped_resume:
+            console.print(
+                f"[dim]--resume: skipping {n_skipped_resume} "
+                f"already-processed file(s).[/dim]"
+            )
 
     console.print(
-        f"[green]Found {len(marked_files)} note(s)[/green] "
-        f"containing tag '[bold]{marker_tag}[/bold]'."
+        f"[green]Found {n_discovered} note(s)[/green] "
+        f"containing tag '[bold]{marker_tag}[/bold]'"
+        + (f", selected {n_selected}" if n_selected != n_discovered else "")
+        + (f", processing {len(selected)}" if len(selected) != n_selected else "")
+        + "."
     )
     if dry_run:
         console.print("[dim]Dry-run — no files will be written.[/dim]")
 
     # ------------------------------------------------------------------
-    # Process each marked file
+    # Process files (sequential or parallel LLM calls)
     # ------------------------------------------------------------------
     n_processed = n_updated = n_skipped = n_errors = 0
 
-    for md_path in marked_files:
-        try:
-            content = md_path.read_text(encoding="utf-8")
-        except OSError as exc:
-            console.print(f"[red]Error reading {md_path.name}:[/red] {exc}")
-            n_errors += 1
-            continue
+    def _handle_result(
+        md_path: Path,
+        original: str,
+        new_content: str,
+        changed: bool,
+        error: str | None,
+    ) -> None:
+        nonlocal n_processed, n_updated, n_skipped, n_errors
 
-        console.print(
-            f"\n[cyan]Processing:[/cyan] {md_path.name}  "
-            f"[dim]model={metadata_model}[/dim]"
-        )
+        if error:
+            console.print(f"[red]Error ({md_path.name}):[/red] {error}")
+            n_errors += 1
+            return
+
         n_processed += 1
 
-        # Call the LLM
-        with console.status("[yellow]Calling Ollama…[/yellow]"):
-            response = client.generate(build_frontmatter_prompt(content))
-
-        try:
-            new_content, changed = apply_metadata_to_content(
-                content,
-                response,
-                allowed_keys=allowed,
-                vocab=vocab,
-                force=effective_force,
-            )
-        except ValueError as exc:
-            console.print(f"[red]Metadata validation error:[/red] {exc}")
-            console.print("[yellow]No changes written — note is unchanged.[/yellow]")
-            n_errors += 1
-            continue
-
-        # Remove marker tag if requested (regardless of whether metadata changed)
-        if remove_tag:
-            stripped = remove_marker_tag(new_content, marker_tag)
-            if stripped != new_content:
-                new_content = stripped
-                changed = True
-
         if not changed:
-            console.print("[green]  No changes needed.[/green]")
-            continue
+            console.print(f"[green]  No changes needed:[/green] {md_path.name}")
+            n_skipped += 1
+            return
 
-        # Show diff when requested or when prompting (so user can decide)
+        # Show diff when requested or in interactive mode
         needs_diff = show_diff or (not yes and not dry_run)
         if needs_diff:
-            diff_text = generate_diff(content, new_content, md_path.name)
+            diff_text = generate_diff(original, new_content, md_path.name)
             if diff_text:
-                console.print("\n[bold]Proposed changes:[/bold]")
+                console.print(f"\n[bold]Proposed changes:[/bold] {md_path.name}")
                 console.print(
                     Syntax(diff_text, "diff", theme="monokai", line_numbers=False)
                 )
 
         if dry_run:
-            console.print(
-                f"[dim]  (dry-run) Would update: {md_path.name}[/dim]"
-            )
+            console.print(f"[dim]  (dry-run) Would update: {md_path.name}[/dim]")
             n_updated += 1
-            continue
+            return
 
         if yes:
-            md_path.write_text(new_content, encoding="utf-8")
+            _write_file(md_path, new_content, make_backup=backup)
             console.print(f"[green]  ✓ Updated:[/green] {md_path.name}")
             n_updated += 1
+            processed_set.add(str(md_path.resolve()))
+            _save_processed_set(state_file, marker_tag, processed_set)
         else:
             if not needs_diff:
-                # diff not shown yet — show it before prompting
-                diff_text = generate_diff(content, new_content, md_path.name)
+                diff_text = generate_diff(original, new_content, md_path.name)
                 if diff_text:
-                    console.print("\n[bold]Proposed changes:[/bold]")
+                    console.print(f"\n[bold]Proposed changes:[/bold] {md_path.name}")
                     console.print(
                         Syntax(diff_text, "diff", theme="monokai", line_numbers=False)
                     )
             if click.confirm(f"\nApply changes to {md_path.name}?"):
-                md_path.write_text(new_content, encoding="utf-8")
+                _write_file(md_path, new_content, make_backup=backup)
                 console.print(f"[green]  ✓ Updated:[/green] {md_path.name}")
                 n_updated += 1
+                processed_set.add(str(md_path.resolve()))
+                _save_processed_set(state_file, marker_tag, processed_set)
             else:
                 console.print("[yellow]  Skipped.[/yellow]")
                 n_skipped += 1
 
+    if effective_workers <= 1:
+        # Sequential processing
+        for i, md_path in enumerate(selected):
+            console.print(
+                f"\n[cyan]Processing:[/cyan] {md_path.name}  "
+                f"[dim]model={metadata_model}[/dim]"
+            )
+            with console.status("[yellow]Calling Ollama…[/yellow]"):
+                result = _llm_process_file(
+                    md_path, client, allowed, vocab, effective_force,
+                    marker_tag, remove_tag,
+                )
+            _handle_result(md_path, *result)
+            if batch_size > 0 and (i + 1) % batch_size == 0:
+                console.print(
+                    f"[dim]  Batch progress: {i + 1}/{len(selected)} files[/dim]"
+                )
+    else:
+        # Parallel LLM calls; results handled sequentially from the main thread
+        with ThreadPoolExecutor(max_workers=effective_workers) as pool:
+            futures = [
+                pool.submit(
+                    _llm_process_file,
+                    md_path, client, allowed, vocab, effective_force,
+                    marker_tag, remove_tag,
+                )
+                for md_path in selected
+            ]
+            for i, (md_path, future) in enumerate(zip(selected, futures)):
+                console.print(
+                    f"\n[cyan]Processing:[/cyan] {md_path.name}  "
+                    f"[dim]model={metadata_model}[/dim]"
+                )
+                _handle_result(md_path, *future.result())
+                if batch_size > 0 and (i + 1) % batch_size == 0:
+                    console.print(
+                        f"[dim]  Batch progress: {i + 1}/{len(selected)} files[/dim]"
+                    )
+
     # ------------------------------------------------------------------
     # Summary
     # ------------------------------------------------------------------
-    parts = [
+    summary_parts = [
+        f"Discovered: [bold]{n_discovered}[/bold]",
         f"Processed: [bold]{n_processed}[/bold]",
         f"Updated: [bold]{n_updated}[/bold]",
     ]
+    if n_selected != n_discovered:
+        summary_parts.insert(1, f"Selected: [bold]{n_selected}[/bold]")
     if n_skipped:
-        parts.append(f"Skipped: {n_skipped}")
+        summary_parts.append(f"Skipped: {n_skipped}")
     if n_errors:
-        parts.append(f"Errors: {n_errors}")
-    console.print("\n[green]✓ Done.[/green]  " + "  ".join(parts))
+        summary_parts.append(f"Errors: [red]{n_errors}[/red]")
+    console.print("\n[green]✓ Done.[/green]  " + "  ".join(summary_parts))
 
 
 # ---------------------------------------------------------------------------

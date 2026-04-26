@@ -241,6 +241,84 @@ obsassist analyze --file note.md --config path\to\config.yml
 
 ---
 
+## Batch metadata: `metadata apply`
+
+Apply metadata to **all notes that carry a marker tag** — without touching
+any other notes.  This is the recommended workflow for bulk first-time
+metadata generation.
+
+### How it works
+
+1. Mark notes you want to process by adding a tag (e.g. `add-metadata`) to
+   the frontmatter `tags` list **or** by writing `#add-metadata` anywhere in
+   the body.
+2. Run `obsassist metadata apply --tag add-metadata`.
+3. The command scans the vault, calls the LLM for each matching note, and
+   applies the same strict guardrails as `metadata update` (schema allowlist,
+   conservative merge, vocab normalisation).
+
+### Dry-run preview (no writes)
+
+```powershell
+obsassist metadata apply --tag add-metadata --dry-run --diff --config "C:\path\to\config.yml"
+```
+
+Shows proposed frontmatter changes for every matching note without writing
+anything.
+
+### Full batch with auto-confirm and marker removal
+
+```powershell
+obsassist metadata apply --tag add-metadata --yes --remove-tag --config "C:\path\to\config.yml"
+```
+
+* `--yes` — applies changes without asking per file.
+* `--remove-tag` — removes the `add-metadata` marker **only after** a
+  successful write.  If the update fails the marker is kept so the note stays
+  in the queue for the next run.
+
+### Resume an interrupted batch
+
+```powershell
+# First run (interrupted)
+obsassist metadata apply --tag add-metadata --yes --remove-tag --config config.yml
+
+# Resume: skips notes already processed
+obsassist metadata apply --tag add-metadata --yes --remove-tag --resume --config config.yml
+```
+
+Progress is saved to `<vault>/.obsassist/metadata-apply-state.json` after
+each successful write.  Pass `--resume` on the next run to skip those files.
+
+### All options
+
+| Flag | Default | Description |
+|---|---|---|
+| `--tag` / `-t` | *(required)* | Marker tag to search for (leading `#` optional) |
+| `--remove-tag` | off | Remove the marker after a successful write |
+| `--dry-run` | off | Scan and show changes without writing |
+| `--diff` | off | Always show a unified diff of proposed changes |
+| `--limit` / `-n` | 0 | Max notes to process (0 = no limit) |
+| `--yes` / `-y` | off | Auto-confirm all writes |
+| `--force` | off | Overwrite existing frontmatter (full regeneration) |
+| `--batch` | 0 | Print a progress line every N files (0 = silent) |
+| `--workers` / `-w` | 1 | Parallel LLM workers (requires `--yes` or `--dry-run`) |
+| `--path` | *(vault root)* | Restrict scan to this sub-path inside the vault |
+| `--resume` | off | Skip files already processed in a previous run |
+| `--backup` / `--no-backup` | on | Create a `.bak` copy before each write |
+| `--config` / `-c` | `config.yml` | Path to a YAML config file |
+
+### Safety invariants
+
+* The **markdown body is never modified** — only the YAML frontmatter block
+  is touched.
+* A `.bak` file is created before each write (disable with `--no-backup`).
+* `--remove-tag` only removes the marker when the write succeeds; on any
+  error the note is left completely unchanged.
+* In `--dry-run` mode no files are written and no markers are removed.
+
+---
+
 ## Indexing
 
 The index lets you search your entire vault for notes that contain specific words or phrases.
@@ -440,6 +518,7 @@ PARA-notes-AI-assistant/
 │   ├── cli.py              # Click commands: analyze, metadata, index, search, embeddings, ask
 │   ├── config.py           # YAML config loading + MetadataConfig + EmbeddingsConfig + get_index_path()
 │   ├── metadata_guard.py   # Strict frontmatter guardrails: sanitize, merge, vocab, write
+│   ├── tag_scanner.py      # Marker-tag detection + removal (has_marker_tag, remove_marker_tag)
 │   ├── indexer.py          # SQLite FTS5 index build/update + metadata extraction
 │   ├── search.py           # Full-text search over the FTS5 index
 │   ├── chunker.py          # Markdown-aware text chunker (heading + size split)
@@ -451,7 +530,9 @@ PARA-notes-AI-assistant/
 │   ├── ollama_client.py    # HTTP wrapper for Ollama /api/generate + /api/embeddings
 │   └── prompts.py          # prompt templates + response parser
 └── tests/
-    ├── test_metadata_guard.py  # strict metadata guardrails (56 tests)
+    ├── test_metadata_guard.py  # strict metadata guardrails
+    ├── test_tag_scanner.py     # marker-tag detection and removal (has/remove)
+    ├── test_metadata_apply_cmd.py  # metadata apply CLI command (24 tests)
     ├── test_parser.py
     ├── test_filters.py
     ├── test_diff.py
