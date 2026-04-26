@@ -5,9 +5,15 @@ Commands
 obsassist analyze  --file <path> [--yes] [--config <path>]
     Full analysis: Summary + Questions + Metadata suggestions.
 
-obsassist metadata --file <path> [--yes] [--config <path>]
-    Metadata suggestions only (Summary / Questions are preserved when a
-    block already exists).
+obsassist metadata update --file <path> [--yes] [--config <path>]
+    Metadata suggestions only for a single note (Summary / Questions are
+    preserved when a block already exists).
+
+obsassist metadata apply --tag <tag> [--vault <path>] [--remove-tag]
+                         [--dry-run] [--diff] [--limit N] [--yes] [--force]
+                         [--config <path>]
+    Batch-apply metadata to all vault notes that contain the marker tag
+    (in frontmatter tags list or as an inline #tag in the body).
 
 obsassist index build [--config <path>] [--index-path <path>]
     Full rebuild of the full-text search index from scratch.
@@ -31,7 +37,9 @@ obsassist ask "<question>" [--mode fts|vector|hybrid] [--k N]
 """
 from __future__ import annotations
 
+import json
 import sys
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import click
@@ -46,6 +54,7 @@ from .embeddings import build_embeddings, update_embeddings
 from .filters import is_excluded
 from .indexer import build_index, update_index
 from .metadata_guard import ALLOWED_KEYS, apply_metadata_to_content, load_vocab
+from .tag_scanner import has_marker_tag, remove_marker_tag
 from .ollama_client import OllamaClient
 from .parser import (
     AssistantBlock,
@@ -131,6 +140,94 @@ def _show_and_confirm(diff: str, path: Path, updated: str, yes: bool) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Metadata apply helpers
+# ---------------------------------------------------------------------------
+
+
+def _metadata_state_path(vault_root: Path) -> Path:
+    """Return the path to the metadata-apply state file."""
+    return vault_root / ".obsassist" / "metadata-apply-state.json"
+
+
+def _load_processed_set(state_path: Path, tag: str) -> set[str]:
+    """Return the set of already-processed absolute file paths for *tag*."""
+    if not state_path.exists():
+        return set()
+    try:
+        with open(state_path, encoding="utf-8") as fh:
+            data = json.load(fh)
+        if data.get("tag") == tag:
+            return set(data.get("processed", []))
+    except (json.JSONDecodeError, OSError):
+        pass
+    return set()
+
+
+def _save_processed_set(state_path: Path, tag: str, processed: set[str]) -> None:
+    """Persist the set of processed file paths to the state file."""
+    state_path.parent.mkdir(parents=True, exist_ok=True)
+    with open(state_path, "w", encoding="utf-8") as fh:
+        json.dump(
+            {"tag": tag, "processed": sorted(processed)},
+            fh,
+            indent=2,
+            ensure_ascii=False,
+        )
+
+
+def _write_file(path: Path, content: str, *, make_backup: bool = False) -> None:
+    """Write *content* to *path*, optionally creating a ``.bak`` copy first."""
+    if make_backup:
+        bak = path.with_suffix(path.suffix + ".bak")
+        bak.write_bytes(path.read_bytes())
+    path.write_text(content, encoding="utf-8")
+
+
+def _llm_process_file(
+    md_path: Path,
+    client: OllamaClient,
+    allowed: set[str],
+    vocab: dict | None,
+    effective_force: bool,
+    marker_tag: str,
+    do_remove_tag: bool,
+) -> tuple[str, str, bool, str | None]:
+    """Read a note, call the LLM, and compute new content.
+
+    Returns ``(original, new_content, changed, error)``.
+    *error* is ``None`` on success, or a short error description.
+    """
+    try:
+        original = md_path.read_text(encoding="utf-8")
+    except OSError as exc:
+        return "", "", False, f"read error: {exc}"
+
+    try:
+        response = client.generate(build_frontmatter_prompt(original))
+    except Exception as exc:  # noqa: BLE001
+        return original, original, False, f"LLM error: {exc}"
+
+    try:
+        new_content, changed = apply_metadata_to_content(
+            original,
+            response,
+            allowed_keys=allowed,
+            vocab=vocab,
+            force=effective_force,
+        )
+    except ValueError as exc:
+        return original, original, False, f"validation error: {exc}"
+
+    if do_remove_tag:
+        stripped = remove_marker_tag(new_content, marker_tag)
+        if stripped != new_content:
+            new_content = stripped
+            changed = True
+
+    return original, new_content, changed, None
+
+
+# ---------------------------------------------------------------------------
 # Commands
 # ---------------------------------------------------------------------------
 
@@ -184,7 +281,17 @@ def analyze(file_path: str, yes: bool, config_path: str | None) -> None:
     _show_and_confirm(diff, path, updated, yes)
 
 
-@main.command()
+# ---------------------------------------------------------------------------
+# Metadata command group
+# ---------------------------------------------------------------------------
+
+
+@main.group()
+def metadata() -> None:
+    """Update YAML frontmatter metadata — body content is never modified."""
+
+
+@metadata.command("update")
 @click.option(
     "--file",
     "-f",
@@ -213,8 +320,8 @@ def analyze(file_path: str, yes: bool, config_path: str | None) -> None:
     default=False,
     help="Overwrite existing frontmatter fields (full regeneration).",
 )
-def metadata(file_path: str, yes: bool, config_path: str | None, force: bool) -> None:
-    """Update YAML frontmatter metadata only — body content is never modified.
+def metadata_update(file_path: str, yes: bool, config_path: str | None, force: bool) -> None:
+    """Update YAML frontmatter metadata for a single note.
 
     LLM suggestions are validated against a strict schema allowlist before
     writing.  Unknown keys are silently dropped.  Existing user-authored
@@ -273,6 +380,376 @@ def metadata(file_path: str, yes: bool, config_path: str | None, force: bool) ->
 
     diff = generate_diff(content, updated, path.name)
     _show_and_confirm(diff, path, updated, yes)
+
+
+@metadata.command("apply")
+@click.option(
+    "--tag",
+    "-t",
+    "marker_tag",
+    required=True,
+    help="Marker tag to look for (e.g. add-metadata).  Leading '#' is optional.",
+)
+@click.option(
+    "--remove-tag",
+    "remove_tag",
+    is_flag=True,
+    default=False,
+    help="Remove the marker tag from the note after a successful metadata update.",
+)
+@click.option(
+    "--dry-run",
+    "dry_run",
+    is_flag=True,
+    default=False,
+    help="Scan and show proposed changes without writing any files.",
+)
+@click.option(
+    "--diff",
+    "show_diff",
+    is_flag=True,
+    default=False,
+    help="Show a unified diff of proposed frontmatter changes.",
+)
+@click.option(
+    "--limit",
+    "-n",
+    default=0,
+    show_default=True,
+    help="Maximum number of notes to process (0 = no limit).",
+)
+@click.option(
+    "--yes",
+    "-y",
+    is_flag=True,
+    help="Auto-apply changes without per-file confirmation.",
+)
+@click.option(
+    "--config",
+    "-c",
+    "config_path",
+    default=None,
+    type=click.Path(exists=True),
+    help="Path to a YAML config file (default: config.yml in cwd).",
+)
+@click.option(
+    "--force",
+    is_flag=True,
+    default=False,
+    help="Overwrite existing frontmatter fields (full regeneration).",
+)
+@click.option(
+    "--batch",
+    "--batch-size",
+    "batch_size",
+    default=0,
+    show_default=True,
+    help="Print a progress line after every N files (0 = disabled).",
+)
+@click.option(
+    "--workers",
+    "-w",
+    default=1,
+    show_default=True,
+    help=(
+        "Number of parallel LLM workers.  "
+        "Requires --yes or --dry-run; interactive mode falls back to 1."
+    ),
+)
+@click.option(
+    "--path",
+    "scope_path",
+    default=None,
+    type=click.Path(),
+    help="Restrict the scan to this sub-path within the vault.",
+)
+@click.option(
+    "--resume",
+    "resume",
+    is_flag=True,
+    default=False,
+    help=(
+        "Skip files already processed in a previous run "
+        "(state stored in <vault>/.obsassist/metadata-apply-state.json)."
+    ),
+)
+@click.option(
+    "--backup/--no-backup",
+    "backup",
+    default=True,
+    help="Create a .bak copy before overwriting each note (default: on).",
+)
+def metadata_apply(
+    marker_tag: str,
+    remove_tag: bool,
+    dry_run: bool,
+    show_diff: bool,
+    limit: int,
+    yes: bool,
+    config_path: str | None,
+    force: bool,
+    batch_size: int,
+    workers: int,
+    scope_path: str | None,
+    resume: bool,
+    backup: bool,
+) -> None:
+    """Batch-apply metadata to notes marked with a tag.
+
+    Scans the vault for all Markdown notes that contain MARKER_TAG either in
+    their frontmatter ``tags`` list or as an inline ``#tag`` in the body.
+    For each matching note the LLM is called and metadata is updated using
+    the same strict guardrails as ``metadata update``.
+
+    Examples:
+
+    \b
+      # Preview changes without writing
+      obsassist metadata apply --tag add-metadata --dry-run --diff
+
+    \b
+      # Apply to all marked notes, auto-confirm, remove the marker afterwards
+      obsassist metadata apply --tag add-metadata --yes --remove-tag
+
+    \b
+      # Process at most 5 notes
+      obsassist metadata apply --tag add-metadata --limit 5
+
+    \b
+      # Resume a previously interrupted batch
+      obsassist metadata apply --tag add-metadata --yes --resume
+    """
+    cfg = load_config(Path(config_path) if config_path else None)
+
+    if not cfg.vault_root:
+        console.print(
+            "[red]Error:[/red] vault_root is not set. "
+            "Add it to your config.yml or set --config."
+        )
+        sys.exit(1)
+
+    vault_root = Path(cfg.vault_root)
+    if not vault_root.is_dir():
+        console.print(f"[red]Error:[/red] vault_root does not exist: {vault_root}")
+        sys.exit(1)
+
+    # Resolve scan root (optional sub-path restriction)
+    if scope_path:
+        scan_root = vault_root / scope_path
+        if not scan_root.is_dir():
+            console.print(
+                f"[red]Error:[/red] --path '{scope_path}' does not exist "
+                f"inside vault_root: {vault_root}"
+            )
+            sys.exit(1)
+    else:
+        scan_root = vault_root
+
+    # Determine model and effective options
+    metadata_model = cfg.metadata.model or cfg.ollama.model
+    effective_force = force or cfg.metadata.force
+
+    client = OllamaClient(
+        base_url=cfg.ollama.base_url,
+        model=metadata_model,
+        temperature=cfg.ollama.temperature,
+    )
+    if not client.health_check():
+        console.print(
+            f"[red]Error:[/red] Cannot reach Ollama at [bold]{cfg.ollama.base_url}[/bold].\n"
+            "Make sure Ollama is running: [bold]ollama serve[/bold]"
+        )
+        sys.exit(1)
+
+    vocab = load_vocab(cfg.metadata.vocab_path) if cfg.metadata.vocab_path else None
+    allowed = set(ALLOWED_KEYS) | set(cfg.metadata.extra_allowed_keys)
+    vault_root_resolved = vault_root.resolve()
+
+    # Interactive mode is incompatible with workers > 1
+    effective_workers = workers
+    if effective_workers > 1 and not (yes or dry_run):
+        console.print(
+            "[yellow]Warning:[/yellow] --workers > 1 requires --yes or --dry-run; "
+            "falling back to sequential processing."
+        )
+        effective_workers = 1
+
+    # ------------------------------------------------------------------
+    # Load resume state
+    # ------------------------------------------------------------------
+    state_file = _metadata_state_path(vault_root)
+    processed_set: set[str] = (
+        _load_processed_set(state_file, marker_tag) if resume else set()
+    )
+
+    # ------------------------------------------------------------------
+    # Scan vault for marked files
+    # ------------------------------------------------------------------
+    console.print(
+        f"[cyan]Scanning vault:[/cyan] {scan_root}  "
+        f"[dim]tag={marker_tag}[/dim]"
+    )
+
+    discovered: list[Path] = []
+    with console.status("[yellow]Scanning…[/yellow]"):
+        for md_path in sorted(scan_root.rglob("*.md")):
+            if is_excluded(md_path.resolve(), vault_root_resolved, cfg.exclude_paths):
+                continue
+            try:
+                content = md_path.read_text(encoding="utf-8")
+            except OSError:
+                continue
+            if has_marker_tag(content, marker_tag):
+                discovered.append(md_path)
+
+    n_discovered = len(discovered)
+    if not discovered:
+        console.print(f"[yellow]No notes found containing tag '{marker_tag}'.[/yellow]")
+        return
+
+    # Apply --limit before resume filtering
+    selected = discovered[:limit] if limit and limit > 0 else list(discovered)
+    n_selected = len(selected)
+
+    # Skip already-processed files when resuming
+    if resume and processed_set:
+        selected = [p for p in selected if str(p.resolve()) not in processed_set]
+        n_skipped_resume = n_selected - len(selected)
+        if n_skipped_resume:
+            console.print(
+                f"[dim]--resume: skipping {n_skipped_resume} "
+                f"already-processed file(s).[/dim]"
+            )
+
+    console.print(
+        f"[green]Found {n_discovered} note(s)[/green] "
+        f"containing tag '[bold]{marker_tag}[/bold]'"
+        + (f", selected {n_selected}" if n_selected != n_discovered else "")
+        + (f", processing {len(selected)}" if len(selected) != n_selected else "")
+        + "."
+    )
+    if dry_run:
+        console.print("[dim]Dry-run — no files will be written.[/dim]")
+
+    # ------------------------------------------------------------------
+    # Process files (sequential or parallel LLM calls)
+    # ------------------------------------------------------------------
+    n_processed = n_updated = n_skipped = n_errors = 0
+
+    def _handle_result(
+        md_path: Path,
+        original: str,
+        new_content: str,
+        changed: bool,
+        error: str | None,
+    ) -> None:
+        nonlocal n_processed, n_updated, n_skipped, n_errors
+
+        if error:
+            console.print(f"[red]Error ({md_path.name}):[/red] {error}")
+            n_errors += 1
+            return
+
+        n_processed += 1
+
+        if not changed:
+            console.print(f"[green]  No changes needed:[/green] {md_path.name}")
+            n_skipped += 1
+            return
+
+        # Show diff when requested or in interactive mode
+        needs_diff = show_diff or (not yes and not dry_run)
+        if needs_diff:
+            diff_text = generate_diff(original, new_content, md_path.name)
+            if diff_text:
+                console.print(f"\n[bold]Proposed changes:[/bold] {md_path.name}")
+                console.print(
+                    Syntax(diff_text, "diff", theme="monokai", line_numbers=False)
+                )
+
+        if dry_run:
+            console.print(f"[dim]  (dry-run) Would update: {md_path.name}[/dim]")
+            n_updated += 1
+            return
+
+        if yes:
+            _write_file(md_path, new_content, make_backup=backup)
+            console.print(f"[green]  ✓ Updated:[/green] {md_path.name}")
+            n_updated += 1
+            processed_set.add(str(md_path.resolve()))
+            _save_processed_set(state_file, marker_tag, processed_set)
+        else:
+            if not needs_diff:
+                diff_text = generate_diff(original, new_content, md_path.name)
+                if diff_text:
+                    console.print(f"\n[bold]Proposed changes:[/bold] {md_path.name}")
+                    console.print(
+                        Syntax(diff_text, "diff", theme="monokai", line_numbers=False)
+                    )
+            if click.confirm(f"\nApply changes to {md_path.name}?"):
+                _write_file(md_path, new_content, make_backup=backup)
+                console.print(f"[green]  ✓ Updated:[/green] {md_path.name}")
+                n_updated += 1
+                processed_set.add(str(md_path.resolve()))
+                _save_processed_set(state_file, marker_tag, processed_set)
+            else:
+                console.print("[yellow]  Skipped.[/yellow]")
+                n_skipped += 1
+
+    if effective_workers <= 1:
+        # Sequential processing
+        for i, md_path in enumerate(selected):
+            console.print(
+                f"\n[cyan]Processing:[/cyan] {md_path.name}  "
+                f"[dim]model={metadata_model}[/dim]"
+            )
+            with console.status("[yellow]Calling Ollama…[/yellow]"):
+                result = _llm_process_file(
+                    md_path, client, allowed, vocab, effective_force,
+                    marker_tag, remove_tag,
+                )
+            _handle_result(md_path, *result)
+            if batch_size > 0 and (i + 1) % batch_size == 0:
+                console.print(
+                    f"[dim]  Batch progress: {i + 1}/{len(selected)} files[/dim]"
+                )
+    else:
+        # Parallel LLM calls; results handled sequentially from the main thread
+        with ThreadPoolExecutor(max_workers=effective_workers) as pool:
+            futures = [
+                pool.submit(
+                    _llm_process_file,
+                    md_path, client, allowed, vocab, effective_force,
+                    marker_tag, remove_tag,
+                )
+                for md_path in selected
+            ]
+            for i, (md_path, future) in enumerate(zip(selected, futures)):
+                console.print(
+                    f"\n[cyan]Processing:[/cyan] {md_path.name}  "
+                    f"[dim]model={metadata_model}[/dim]"
+                )
+                _handle_result(md_path, *future.result())
+                if batch_size > 0 and (i + 1) % batch_size == 0:
+                    console.print(
+                        f"[dim]  Batch progress: {i + 1}/{len(selected)} files[/dim]"
+                    )
+
+    # ------------------------------------------------------------------
+    # Summary
+    # ------------------------------------------------------------------
+    summary_parts = [
+        f"Discovered: [bold]{n_discovered}[/bold]",
+        f"Processed: [bold]{n_processed}[/bold]",
+        f"Updated: [bold]{n_updated}[/bold]",
+    ]
+    if n_selected != n_discovered:
+        summary_parts.insert(1, f"Selected: [bold]{n_selected}[/bold]")
+    if n_skipped:
+        summary_parts.append(f"Skipped: {n_skipped}")
+    if n_errors:
+        summary_parts.append(f"Errors: [red]{n_errors}[/red]")
+    console.print("\n[green]✓ Done.[/green]  " + "  ".join(summary_parts))
 
 
 # ---------------------------------------------------------------------------
