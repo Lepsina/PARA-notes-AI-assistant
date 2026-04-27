@@ -78,17 +78,35 @@ _METADATA_TEMPLATE = """\
 _FRONTMATTER_TEMPLATE = """\
 Ты — ассистент по метаданным Obsidian. Проанализируй заметку и верни ТОЛЬКО YAML-поля для frontmatter.
 
-Допустимые поля: title, status, lang, tags, topics, entities, summary, priority, source_type, aliases
+Допустимые поля: status, lang, tags, topics, summary, aliases
 
 Правила:
 - Отвечай ТОЛЬКО валидным YAML (без markdown-обёрток, без пояснений, без дополнительного текста).
 - tags: список тегов из заметки (snake_case, нижний регистр).
 - topics: список канонических тем (английские ключевые слова, kebab-case).
 - status: draft | active | done (только одно значение).
-- priority: high | medium | low (только если очевидно из текста, иначе не включай поле).
-- summary: краткое описание заметки одной строкой.
+- summary: краткое описание заметки одной строкой. ОБЯЗАТЕЛЬНО на русском языке.
+- Не добавляй поля: title, priority, entities, source_type — они запрещены.
 - Не добавляй поля, которые невозможно определить из текста.
 - Не добавляй комментарии.
+
+---
+Заметка:
+{note_content}
+"""
+
+_FRONTMATTER_TEMPLATE_STRICT_RU = """\
+Ты — ассистент по метаданным Obsidian. Проанализируй заметку и верни ТОЛЬКО YAML-поля для frontmatter.
+
+ВАЖНО: поле summary ДОЛЖНО быть написано исключительно на русском языке. \
+Предыдущий ответ содержал summary не на русском — это ошибка. Исправь.
+
+Допустимые поля: status, lang, tags, topics, summary, aliases
+
+Правила:
+- Отвечай ТОЛЬКО валидным YAML (без markdown-обёрток, без пояснений).
+- summary: краткое описание ТОЛЬКО НА РУССКОМ языке.
+- Не добавляй поля: title, priority, entities, source_type.
 
 ---
 Заметка:
@@ -104,6 +122,13 @@ def build_frontmatter_prompt(note_content: str) -> str:
     """
     return _FRONTMATTER_TEMPLATE.format(note_content=note_content)
 
+
+def build_frontmatter_prompt_strict_ru(note_content: str) -> str:
+    """Return a stricter metadata prompt that explicitly enforces Russian summary.
+
+    Used as a retry when the first response contains a non-Russian summary.
+    """
+    return _FRONTMATTER_TEMPLATE_STRICT_RU.format(note_content=note_content)
 
 
 _ASK_TEMPLATE = """\

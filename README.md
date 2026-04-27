@@ -198,22 +198,65 @@ Overwrites all existing frontmatter fields with the LLM suggestions (full regene
 
 | Key | Type | Notes |
 |---|---|---|
-| `title` | string | Note title |
+| `title` | string | Note title (**LLM-restricted** — off by default) |
 | `created` | string | Creation date (`YYYY-MM-DD`) |
 | `updated` | string | Last update date (auto-set on change) |
-| `type` | string | Note type |
-| `status` | string | `draft` \| `active` \| `done` |
+| `type` | string | **Set deterministically** from file path (see below) |
+| `status` | string | `draft` \| `active` \| `done` — inferred deterministically |
 | `lang` | string | Language code |
 | `tags` | list | Original tags preserved |
 | `topics` | list | Canonical topics (normalised via vocab) |
-| `entities` | list | Named entities |
-| `summary` | string | One-line description |
-| `priority` | string | `high` \| `medium` \| `low` |
-| `source_type` | string | Source type |
+| `entities` | list | Named entities (**LLM-restricted** — off by default) |
+| `summary` | string | One-line description in **Russian** (non-RU is dropped) |
+| `priority` | string | `high` \| `medium` \| `low` (**LLM-restricted** — off by default) |
+| `source_type` | string | Source type (**LLM-restricted** — off by default) |
 | `exclude_from_ai` | boolean | Skip in AI queries |
 | `aliases` | list | Note aliases |
+| `confidence` | float | Deterministic quality score \[0, 1\] (optional) |
 
 Keys **not** in this list are discarded unless added via `extra_allowed_keys` in config.
+
+> **LLM-restricted keys** (`title`, `entities`, `source_type`, `priority`) are silently dropped
+> from LLM output by default.  Enable them via `metadata.llm_allow.*` toggles in `config.yml`.
+
+#### Deterministic `type` inference
+
+`type` is always derived from the file path — the LLM cannot override it:
+
+| Path condition | `type` value |
+|---|---|
+| `Daily/` folder **or** filename matches `YYYY-MM-DD*` | `daily` |
+| `Projects/` folder | `project` |
+| `Areas/` folder | `area` |
+| `Resources/` folder | `resource` |
+| `0. Buffer/` folder | `note` |
+| everything else | `note` |
+
+#### Deterministic `status` inference
+
+`status` is also inferred deterministically (LLM suggestion is ignored when a rule applies):
+
+| Condition | `status` |
+|---|---|
+| Path is inside `0. Buffer/` | `draft` |
+| Note contains tag `#дописать` | `draft` |
+| Note contains tag `#просмотреть` | `active` |
+| Note type is `project` or `area` | `active` (configurable) |
+| Everything else | *(not set)* |
+
+#### Russian-only `summary`
+
+The `summary` field must be in Russian.  If the LLM returns a non-Russian summary:
+
+1. A single retry is made with a stricter Russian-language instruction.
+2. If the retry still returns non-Russian, `summary` is omitted and a warning is emitted.
+
+#### `confidence` score
+
+When `metadata.include_confidence: true`, a `confidence` field (0.00–1.00) is added.
+It is computed deterministically based on: YAML parsing success, schema validation,
+body-unchanged invariant, deterministic type inference, topics vocab check, and
+Russian summary check.
 
 #### Legacy aliases (automatically normalised)
 
@@ -221,6 +264,7 @@ Keys **not** in this list are discarded unless added via `extra_allowed_keys` in
 |---|---|
 | `topic:` | `topics:` (list) |
 | `tag:` | `tags:` (list) |
+| `exclude-from-ai:` | `exclude_from_ai:` (bool) |
 | `status: complete` | `status: done` |
 | `status: completed` | `status: done` |
 | `status: in_progress` | `status: active` |

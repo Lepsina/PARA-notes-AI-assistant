@@ -10,10 +10,15 @@ Responsibilities
   (unless *force=True*).
 * Rebuild frontmatter and reconstruct the note with body byte-for-byte
   unchanged.
+* Deterministic type/status inference from file path and tags.
+* YAML fence stripping for LLM output.
+* Russian-language heuristic for summary validation.
+* Confidence score computation.
 """
 from __future__ import annotations
 
 import re
+import warnings
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -40,7 +45,14 @@ ALLOWED_KEYS: frozenset[str] = frozenset(
         "source_type",
         "exclude_from_ai",
         "aliases",
+        "confidence",
     }
+)
+
+# Keys that the LLM is NOT allowed to set by default.
+# Each can be unlocked via metadata.llm_allow.<key> = true in config.
+LLM_RESTRICTED_KEYS: frozenset[str] = frozenset(
+    {"title", "entities", "source_type", "priority"}
 )
 
 ARRAY_FIELDS: frozenset[str] = frozenset({"tags", "topics", "entities", "aliases"})
@@ -52,6 +64,8 @@ KEY_ALIASES: dict[str, str] = {
     "tag": "tags",
     "alias": "aliases",
     "entity": "entities",
+    # Support the hyphenated alias for exclude_from_ai
+    "exclude-from-ai": "exclude_from_ai",
 }
 
 # Status value aliases (lower → canonical)
@@ -61,6 +75,231 @@ STATUS_ALIASES: dict[str, str] = {
     "in_progress": "active",
     "in-progress": "active",
 }
+
+# ---------------------------------------------------------------------------
+# Deterministic type inference
+# ---------------------------------------------------------------------------
+
+# Regex to recognise daily-note filenames (YYYY-MM-DD*.md)
+_DAILY_FILENAME_RE = re.compile(r"^\d{4}-\d{2}-\d{2}")
+
+
+def infer_type(note_path: Path | str | None) -> str:
+    """Infer the ``type`` frontmatter value deterministically from *note_path*.
+
+    Rules (checked in order against the **resolved** path parts):
+    - ``Daily/`` folder **or** filename matches ``YYYY-MM-DD*``  → ``daily``
+    - ``Projects/`` folder                                        → ``project``
+    - ``Areas/`` folder                                           → ``area``
+    - ``Resources/`` folder                                       → ``resource``
+    - ``0. Buffer/`` folder                                       → ``note``
+    - anything else                                               → ``note``
+    """
+    if note_path is None:
+        return "note"
+    path = Path(note_path)
+    parts = [p.lower() for p in path.parts]
+    stem = path.stem
+
+    # Daily by filename pattern takes priority over folder
+    if _DAILY_FILENAME_RE.match(stem):
+        return "daily"
+
+    for part in parts:
+        if part == "daily":
+            return "daily"
+        if part == "projects":
+            return "project"
+        if part == "areas":
+            return "area"
+        if part == "resources":
+            return "resource"
+
+    return "note"
+
+
+# ---------------------------------------------------------------------------
+# Deterministic status inference
+# ---------------------------------------------------------------------------
+
+# Tags that force status = draft
+_DRAFT_TAGS: frozenset[str] = frozenset({"дописать", "#дописать"})
+# Tags that force status = active
+_ACTIVE_TAGS: frozenset[str] = frozenset({"просмотреть", "#просмотреть"})
+
+
+def infer_status(
+    note_path: Path | str | None,
+    tags: list[str] | None = None,
+    *,
+    default_project_area_status: str = "active",
+) -> str | None:
+    """Infer ``status`` deterministically.
+
+    Returns ``None`` when no status should be set (caller should omit the field).
+
+    Rules:
+    - In ``0. Buffer/``   → ``draft`` (regardless of tags)
+    - tag ``#дописать``   → ``draft``
+    - tag ``#просмотреть``→ ``active``
+    - type project/area   → *default_project_area_status* (``active``)
+    - otherwise           → ``None`` (do not set)
+    """
+    path = Path(note_path) if note_path else None
+
+    # 0. Buffer → draft
+    if path is not None:
+        parts_lower = [p.lower() for p in path.parts]
+        for part in parts_lower:
+            if part.startswith("0.") and "buffer" in part:
+                return "draft"
+
+    # Tag-based overrides
+    norm_tags = [str(t).lower().lstrip("#") for t in (tags or [])]
+    if "дописать" in norm_tags:
+        return "draft"
+    if "просмотреть" in norm_tags:
+        return "active"
+
+    # Default by type
+    note_type = infer_type(path)
+    if note_type in ("project", "area"):
+        return default_project_area_status
+
+    return None
+
+
+# ---------------------------------------------------------------------------
+# exclude_from_ai deterministic rule
+# ---------------------------------------------------------------------------
+
+
+def infer_exclude_from_ai(
+    note_path: Path | str | None,
+    tags: list[str] | None = None,
+    *,
+    private_folders: list[str] | None = None,
+) -> bool | None:
+    """Return ``True`` if the note should be excluded from AI processing.
+
+    Rules (only applied when *private_folders* is provided):
+    - path is under any folder in *private_folders* (e.g. ``Private``, ``People``)
+    - tag ``#private`` is present in *tags*
+
+    Returns ``None`` when exclusion cannot be determined (feature disabled).
+    """
+    if not private_folders:
+        return None
+
+    path = Path(note_path) if note_path else None
+    if path is not None:
+        parts_lower = [p.lower() for p in path.parts]
+        for folder in private_folders:
+            if folder.lower().rstrip("/") in parts_lower:
+                return True
+
+    norm_tags = [str(t).lower().lstrip("#") for t in (tags or [])]
+    if "private" in norm_tags:
+        return True
+
+    return None
+
+
+# ---------------------------------------------------------------------------
+# YAML fence stripper
+# ---------------------------------------------------------------------------
+
+_FENCE_RE = re.compile(
+    r"^[ \t]*`{3,}(?:yaml)?[ \t]*\r?\n(.*?)\r?\n[ \t]*`{3,}[ \t]*$",
+    re.DOTALL | re.MULTILINE,
+)
+
+
+def strip_yaml_fences(text: str) -> str:
+    """Extract YAML content from a fenced code block, if present.
+
+    Handles triple-backtick fences (yaml or plain), quadruple-backtick fences,
+    and responses that start/end with a bare backtick fence line.
+
+    If no fence is detected the text is returned stripped of leading/trailing
+    whitespace.
+    """
+    stripped = text.strip()
+    # Try to match a full fenced block first
+    m = _FENCE_RE.search(stripped)
+    if m:
+        return m.group(1).strip()
+    # Fallback: strip leading/trailing backtick lines
+    lines = stripped.splitlines()
+    # Remove first line if it looks like a fence opener
+    if lines and re.match(r"^`{3,}(?:yaml)?[ \t]*$", lines[0]):
+        lines = lines[1:]
+    # Remove last line if it looks like a fence closer
+    if lines and re.match(r"^`{3,}[ \t]*$", lines[-1]):
+        lines = lines[:-1]
+    return "\n".join(lines).strip()
+
+
+# ---------------------------------------------------------------------------
+# Russian language heuristic
+# ---------------------------------------------------------------------------
+
+# Cyrillic Unicode block: U+0400–U+04FF
+_CYRILLIC_RE = re.compile(r"[\u0400-\u04ff]")
+# Any alphabetic character (broad)
+_ALPHA_RE = re.compile(r"[^\W\d_]", re.UNICODE)
+
+_RU_CYRILLIC_RATIO_THRESHOLD = 0.5  # ≥50 % of alpha chars must be Cyrillic
+
+
+def is_russian(text: str) -> bool:
+    """Return ``True`` when *text* contains predominantly Cyrillic characters.
+
+    An empty string is considered *not* Russian (caller should treat the
+    summary as absent).
+    """
+    if not text or not text.strip():
+        return False
+    alpha_chars = _ALPHA_RE.findall(text)
+    if not alpha_chars:
+        return False
+    cyrillic_chars = _CYRILLIC_RE.findall(text)
+    return len(cyrillic_chars) / len(alpha_chars) >= _RU_CYRILLIC_RATIO_THRESHOLD
+
+
+# ---------------------------------------------------------------------------
+# Confidence score
+# ---------------------------------------------------------------------------
+
+
+def compute_confidence(
+    *,
+    yaml_parsed: bool,
+    schema_valid: bool,
+    body_unchanged: bool,
+    type_inferred: bool,
+    topics_valid: bool,
+    summary_ru: bool | None,
+) -> float:
+    """Compute a deterministic confidence score in [0, 1].
+
+    Each check contributes an equal share.  The *summary_ru* check is only
+    included when a summary was actually produced (``None`` means "no summary
+    → skip check").
+
+    Returns a float rounded to 2 decimal places.
+    """
+    checks: list[bool] = [
+        yaml_parsed,
+        schema_valid,
+        body_unchanged,
+        type_inferred,
+        topics_valid,
+    ]
+    if summary_ru is not None:
+        checks.append(summary_ru)
+    score = sum(checks) / len(checks) if checks else 0.0
+    return round(score, 2)
 
 # ---------------------------------------------------------------------------
 # Frontmatter parsing / writing
@@ -121,11 +360,9 @@ def load_vocab(vocab_path: Path | str | None) -> dict[str, Any]:
             data = yaml.safe_load(fh)
             return data if isinstance(data, dict) else {}
     except yaml.YAMLError as exc:
-        import warnings
         warnings.warn(f"obsassist: could not parse vocab file {path}: {exc}", stacklevel=2)
         return {}
     except OSError as exc:
-        import warnings
         warnings.warn(f"obsassist: could not read vocab file {path}: {exc}", stacklevel=2)
         return {}
 
@@ -140,6 +377,7 @@ def sanitize(
     *,
     allowed_keys: frozenset[str] | set[str] = ALLOWED_KEYS,
     vocab: dict[str, Any] | None = None,
+    llm_allowed_keys: frozenset[str] | set[str] | None = None,
 ) -> dict[str, Any]:
     """Sanitize and normalise LLM-suggested metadata.
 
@@ -147,9 +385,17 @@ def sanitize(
 
     1. Rename legacy key aliases (``topic`` → ``topics``, etc.).
     2. Drop keys not in *allowed_keys*.
-    3. Coerce array fields to ``list[str]``; coerce bool fields.
-    4. Normalise status value aliases.
-    5. Apply vocab normalisation (topics, priority_from_tags).
+    3. Drop keys in ``LLM_RESTRICTED_KEYS`` that are not in *llm_allowed_keys*
+       (only when *llm_allowed_keys* is not ``None``).
+    4. Coerce array fields to ``list[str]``; coerce bool fields.
+    5. Normalise status value aliases.
+    6. Apply vocab normalisation (topics, priority_from_tags).
+
+    *llm_allowed_keys*: explicit set of restricted keys the LLM **is** allowed
+    to set for this call.  When ``None`` (the default), LLM restrictions are
+    **not** applied — this preserves backward compatibility for callers that
+    do not go through the LLM pipeline.  Pass an explicit (possibly empty)
+    set to enable the restriction check.
     """
     if not isinstance(raw, dict):
         return {}
@@ -163,7 +409,15 @@ def sanitize(
     # Step 2: drop unknown keys
     result = {k: v for k, v in renamed.items() if k in allowed_keys}
 
-    # Step 3: coerce types
+    # Step 3: drop restricted keys not explicitly permitted
+    # Only enforced when llm_allowed_keys is provided (not None).
+    if llm_allowed_keys is not None:
+        permitted_restricted = set(llm_allowed_keys)
+        for restricted_key in LLM_RESTRICTED_KEYS:
+            if restricted_key in result and restricted_key not in permitted_restricted:
+                del result[restricted_key]
+
+    # Step 4: coerce types
     for field in ARRAY_FIELDS:
         if field in result:
             result[field] = _to_list(result[field])
@@ -171,12 +425,12 @@ def sanitize(
         if field in result:
             result[field] = bool(result[field])
 
-    # Step 4: normalise status
+    # Step 5: normalise status
     if "status" in result:
         s = str(result["status"]).strip().lower()
         result["status"] = STATUS_ALIASES.get(s, s)
 
-    # Step 5: vocab normalisation
+    # Step 6: vocab normalisation
     if vocab:
         result = _apply_vocab(result, vocab)
 
@@ -320,6 +574,10 @@ def apply_metadata_to_content(
     allowed_keys: frozenset[str] | set[str] = ALLOWED_KEYS,
     vocab: dict[str, Any] | None = None,
     force: bool = False,
+    note_path: Path | str | None = None,
+    llm_allowed_keys: frozenset[str] | set[str] | None = None,
+    include_confidence: bool = False,
+    private_folders: list[str] | None = None,
 ) -> tuple[str, bool]:
     """Parse LLM YAML, sanitise, merge into note frontmatter, return new content.
 
@@ -331,12 +589,30 @@ def apply_metadata_to_content(
     caller can skip the file write.
 
     Raises ``ValueError`` with a human-readable message when *llm_yaml*
-    cannot be parsed or contains no dict.
+    cannot be parsed or contains no dict after fence stripping.
+
+    Parameters
+    ----------
+    note_path:
+        Path to the note on disk.  When provided, ``type`` and ``status`` are
+        inferred deterministically from the path (overwriting any LLM value).
+    llm_allowed_keys:
+        Restricted keys the LLM is permitted to set (see ``sanitize``).
+    include_confidence:
+        When ``True``, compute and store a ``confidence`` field.
+    private_folders:
+        Folder names that trigger ``exclude_from_ai: true`` (e.g. ``Private``,
+        ``People``).
     """
     existing_fm, body = split_frontmatter(content)
 
+    # Strip markdown fences before parsing
+    clean_yaml = strip_yaml_fences(llm_yaml)
+
+    yaml_parsed = False
     try:
-        raw_suggested: Any = yaml.safe_load(llm_yaml)
+        raw_suggested: Any = yaml.safe_load(clean_yaml)
+        yaml_parsed = True
     except yaml.YAMLError as exc:
         raise ValueError(f"LLM returned invalid YAML: {exc}") from exc
 
@@ -348,7 +624,69 @@ def apply_metadata_to_content(
             "expected a key: value mapping."
         )
 
-    sanitized = sanitize(raw_suggested, allowed_keys=allowed_keys, vocab=vocab)
+    sanitized = sanitize(
+        raw_suggested,
+        allowed_keys=allowed_keys,
+        vocab=vocab,
+        llm_allowed_keys=llm_allowed_keys,
+    )
+
+    # --------------------------------------------------------------------------
+    # Deterministic overrides (not from LLM)
+    # Only applied when note_path is provided; otherwise we stay backward-
+    # compatible with tests and callers that don't supply a path.
+    # --------------------------------------------------------------------------
+    tags_for_inference: list[str] = list(
+        sanitized.get("tags") or existing_fm.get("tags") or []
+    )
+
+    type_inferred = False
+    if note_path is not None:
+        # type: always set deterministically when path is known
+        inferred_type = infer_type(note_path)
+        sanitized["type"] = inferred_type
+        type_inferred = True
+
+        # status: set deterministically; only applied when absent or force
+        inferred_status = infer_status(note_path, tags=tags_for_inference)
+        if inferred_status is not None:
+            if "status" not in sanitized:
+                sanitized["status"] = inferred_status
+
+        # exclude_from_ai: deterministic private-folder rule
+        if private_folders:
+            excl = infer_exclude_from_ai(note_path, tags=tags_for_inference,
+                                         private_folders=private_folders)
+            if excl is True and not existing_fm.get("exclude_from_ai"):
+                sanitized["exclude_from_ai"] = True
+
+    # --------------------------------------------------------------------------
+    # Confidence score
+    # --------------------------------------------------------------------------
+    topics_valid = True
+    summary_ru: bool | None = None
+    if "summary" in sanitized:
+        summary_ru = is_russian(str(sanitized["summary"]))
+        if not summary_ru:
+            # Drop non-Russian summary; caller should handle retry
+            warnings.warn(
+                "obsassist: LLM summary appears non-Russian; dropping field.",
+                stacklevel=2,
+            )
+            del sanitized["summary"]
+            summary_ru = None  # not counted in confidence (was omitted)
+
+    if include_confidence:
+        conf = compute_confidence(
+            yaml_parsed=yaml_parsed,
+            schema_valid=True,
+            body_unchanged=True,
+            type_inferred=type_inferred,
+            topics_valid=topics_valid,
+            summary_ru=summary_ru,
+        )
+        sanitized["confidence"] = conf
+
     merged, changed = merge(existing_fm, sanitized, force=force)
 
     if not changed:

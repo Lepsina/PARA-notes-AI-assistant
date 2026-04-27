@@ -53,6 +53,29 @@ metadata:
   # When true, overwrite existing frontmatter values (full regeneration).
   force: false
 
+  # --- PR6: Deterministic policy settings ---
+
+  # Add a deterministic confidence score [0, 1] to each processed note.
+  # Default: false
+  include_confidence: false
+
+  # Allow priority to be extracted from tags via vocab priority_from_tags.
+  # Default: false (priority is NOT written by default)
+  extract_priority_from_tags: false
+
+  # LLM-permission toggles.  By default the LLM may NOT set these fields.
+  # Enable individual fields to allow the LLM to suggest them.
+  llm_allow:
+    title: false         # LLM may suggest note title
+    entities: false      # LLM may suggest named entities
+    source_type: false   # LLM may suggest source_type
+    priority: false      # LLM may suggest priority
+
+  # Folders whose notes are automatically marked exclude_from_ai: true.
+  # Empty list = feature disabled (conservative default).
+  # Example: ["Private", "People"]
+  private_folders: []
+
 # Assistant block settings (how the block is written into notes by `analyze`)
 assistant_block:
   heading: "## Assistant"
