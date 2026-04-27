@@ -698,7 +698,7 @@ class TestIsRussian:
         assert is_russian("") is False
 
     def test_mixed_mostly_cyrillic(self):
-        # "Привет мир" = 10 Cyrillic, " ok" = 2 Latin → 10/12 ≈ 83% Cyrillic
+        # "Привет мир" = 9 Cyrillic, " ok" = 2 Latin → 9/11 ≈ 82% Cyrillic
         assert is_russian("Привет мир ok") is True  # >50% Cyrillic
 
     def test_mixed_mostly_latin(self):

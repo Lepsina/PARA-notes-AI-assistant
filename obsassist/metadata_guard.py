@@ -106,13 +106,13 @@ def infer_type(note_path: Path | str | None) -> str:
         return "daily"
 
     for part in parts:
-        if part in ("daily", "daily/"):
+        if part == "daily":
             return "daily"
-        if part in ("projects", "projects/"):
+        if part == "projects":
             return "project"
-        if part in ("areas", "areas/"):
+        if part == "areas":
             return "area"
-        if part in ("resources", "resources/"):
+        if part == "resources":
             return "resource"
 
     return "note"
@@ -609,9 +609,10 @@ def apply_metadata_to_content(
     # Strip markdown fences before parsing
     clean_yaml = strip_yaml_fences(llm_yaml)
 
-    yaml_parsed = True
+    yaml_parsed = False
     try:
         raw_suggested: Any = yaml.safe_load(clean_yaml)
+        yaml_parsed = True
     except yaml.YAMLError as exc:
         raise ValueError(f"LLM returned invalid YAML: {exc}") from exc
 
