@@ -43,6 +43,7 @@ from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import click
+import yaml
 from rich.console import Console
 from rich.markdown import Markdown
 from rich.syntax import Syntax
@@ -53,7 +54,7 @@ from .diff import generate_diff
 from .embeddings import build_embeddings, update_embeddings
 from .filters import is_excluded
 from .indexer import build_index, update_index
-from .metadata_guard import ALLOWED_KEYS, apply_metadata_to_content, load_vocab
+from .metadata_guard import ALLOWED_KEYS, apply_metadata_to_content, load_vocab, is_russian, strip_yaml_fences
 from .tag_scanner import has_marker_tag, remove_marker_tag
 from .ollama_client import OllamaClient
 from .parser import (
@@ -66,6 +67,7 @@ from .prompts import (
     build_analyze_prompt,
     build_ask_prompt,
     build_frontmatter_prompt,
+    build_frontmatter_prompt_strict_ru,
     build_metadata_prompt,
     parse_ollama_response,
 )
@@ -144,6 +146,21 @@ def _show_and_confirm(diff: str, path: Path, updated: str, yes: bool) -> None:
 # ---------------------------------------------------------------------------
 
 
+def _build_llm_allowed_keys(cfg) -> frozenset[str]:
+    """Return the set of restricted keys the LLM is permitted to set."""
+    allowed: set[str] = set()
+    la = cfg.metadata.llm_allow
+    if la.title:
+        allowed.add("title")
+    if la.entities:
+        allowed.add("entities")
+    if la.source_type:
+        allowed.add("source_type")
+    if la.priority or cfg.metadata.extract_priority_from_tags:
+        allowed.add("priority")
+    return frozenset(allowed)
+
+
 def _metadata_state_path(vault_root: Path) -> Path:
     """Return the path to the metadata-apply state file."""
     return vault_root / ".obsassist" / "metadata-apply-state.json"
@@ -191,11 +208,18 @@ def _llm_process_file(
     effective_force: bool,
     marker_tag: str,
     do_remove_tag: bool,
+    *,
+    llm_allowed_keys: frozenset[str] | None = None,
+    include_confidence: bool = False,
+    private_folders: list[str] | None = None,
 ) -> tuple[str, str, bool, str | None]:
     """Read a note, call the LLM, and compute new content.
 
     Returns ``(original, new_content, changed, error)``.
     *error* is ``None`` on success, or a short error description.
+
+    Performs one RU-summary retry when the first response contains a
+    non-Russian summary.
     """
     try:
         original = md_path.read_text(encoding="utf-8")
@@ -207,6 +231,21 @@ def _llm_process_file(
     except Exception as exc:  # noqa: BLE001
         return original, original, False, f"LLM error: {exc}"
 
+    # Check for non-Russian summary before applying; retry once if needed
+    clean = strip_yaml_fences(response)
+    try:
+        raw_check = yaml.safe_load(clean) or {}
+    except Exception:  # noqa: BLE001
+        raw_check = {}
+    if isinstance(raw_check, dict) and "summary" in raw_check:
+        if not is_russian(str(raw_check.get("summary", ""))):
+            try:
+                response = client.generate(
+                    build_frontmatter_prompt_strict_ru(original)
+                )
+            except Exception as exc:  # noqa: BLE001
+                return original, original, False, f"LLM error (retry): {exc}"
+
     try:
         new_content, changed = apply_metadata_to_content(
             original,
@@ -214,6 +253,10 @@ def _llm_process_file(
             allowed_keys=allowed,
             vocab=vocab,
             force=effective_force,
+            note_path=md_path,
+            llm_allowed_keys=llm_allowed_keys,
+            include_confidence=include_confidence,
+            private_folders=private_folders,
         )
     except ValueError as exc:
         return original, original, False, f"validation error: {exc}"
@@ -350,8 +393,9 @@ def metadata_update(file_path: str, yes: bool, config_path: str | None, force: b
     # Load vocab for normalisation
     vocab = load_vocab(cfg.metadata.vocab_path) if cfg.metadata.vocab_path else None
 
-    # Build the effective allowed-keys set
+    # Build the effective allowed-keys set and LLM permission set
     allowed = set(ALLOWED_KEYS) | set(cfg.metadata.extra_allowed_keys)
+    llm_allowed = _build_llm_allowed_keys(cfg)
 
     console.print(
         f"[cyan]Updating metadata for:[/cyan] {path.name}  "
@@ -361,6 +405,22 @@ def metadata_update(file_path: str, yes: bool, config_path: str | None, force: b
     with console.status("[yellow]Calling Ollama…[/yellow]"):
         response = client.generate(build_frontmatter_prompt(content))
 
+    # RU-summary retry
+    _clean = strip_yaml_fences(response)
+    try:
+        _raw_check = yaml.safe_load(_clean) or {}
+    except Exception:  # noqa: BLE001
+        _raw_check = {}
+    if isinstance(_raw_check, dict) and "summary" in _raw_check:
+        if not is_russian(str(_raw_check.get("summary", ""))):
+            console.print(
+                "[yellow]Warning:[/yellow] summary appears non-Russian; retrying…"
+            )
+            with console.status("[yellow]Retrying (strict RU)…[/yellow]"):
+                response = client.generate(
+                    build_frontmatter_prompt_strict_ru(content)
+                )
+
     try:
         updated, changed = apply_metadata_to_content(
             content,
@@ -368,6 +428,10 @@ def metadata_update(file_path: str, yes: bool, config_path: str | None, force: b
             allowed_keys=allowed,
             vocab=vocab,
             force=effective_force,
+            note_path=path,
+            llm_allowed_keys=llm_allowed,
+            include_confidence=cfg.metadata.include_confidence,
+            private_folders=cfg.metadata.private_folders or None,
         )
     except ValueError as exc:
         console.print(f"[red]Metadata validation error:[/red] {exc}")
@@ -563,6 +627,7 @@ def metadata_apply(
 
     vocab = load_vocab(cfg.metadata.vocab_path) if cfg.metadata.vocab_path else None
     allowed = set(ALLOWED_KEYS) | set(cfg.metadata.extra_allowed_keys)
+    llm_allowed = _build_llm_allowed_keys(cfg)
     vault_root_resolved = vault_root.resolve()
 
     # Interactive mode is incompatible with workers > 1
@@ -707,6 +772,9 @@ def metadata_apply(
                 result = _llm_process_file(
                     md_path, client, allowed, vocab, effective_force,
                     marker_tag, remove_tag,
+                    llm_allowed_keys=llm_allowed,
+                    include_confidence=cfg.metadata.include_confidence,
+                    private_folders=cfg.metadata.private_folders or None,
                 )
             _handle_result(md_path, *result)
             if batch_size > 0 and (i + 1) % batch_size == 0:
@@ -721,6 +789,9 @@ def metadata_apply(
                     _llm_process_file,
                     md_path, client, allowed, vocab, effective_force,
                     marker_tag, remove_tag,
+                    llm_allowed_keys=llm_allowed,
+                    include_confidence=cfg.metadata.include_confidence,
+                    private_folders=cfg.metadata.private_folders or None,
                 )
                 for md_path in selected
             ]

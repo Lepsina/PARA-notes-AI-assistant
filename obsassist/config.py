@@ -28,6 +28,17 @@ class EmbeddingsConfig:
 
 
 @dataclass
+class LlmAllowConfig:
+    """Per-field toggles for whether the LLM may set restricted keys."""
+
+    title: bool = False
+    entities: bool = False
+    source_type: bool = False
+    # priority is always off by default; enable with extract_priority_from_tags
+    priority: bool = False
+
+
+@dataclass
 class MetadataConfig:
     """Settings specific to the ``metadata`` command."""
 
@@ -40,6 +51,15 @@ class MetadataConfig:
     extra_allowed_keys: list[str] = field(default_factory=list)
     # When True, ``metadata`` command overwrites existing user-authored values.
     force: bool = False
+    # Whether to add a deterministic confidence score to each note.
+    include_confidence: bool = False
+    # Extract priority from tags (via vocab priority_from_tags); default off.
+    extract_priority_from_tags: bool = False
+    # LLM-permission toggles for restricted keys.
+    llm_allow: LlmAllowConfig = field(default_factory=LlmAllowConfig)
+    # Folder names whose notes are auto-marked exclude_from_ai: true.
+    # Empty list = feature disabled (conservative default).
+    private_folders: list[str] = field(default_factory=list)
 
 
 @dataclass
@@ -150,11 +170,23 @@ def _parse_config(data: dict[str, Any]) -> Config:
 
     if "metadata" in data:
         md = data["metadata"]
+        # Parse llm_allow sub-section
+        llm_allow_data = md.get("llm_allow") or {}
+        llm_allow = LlmAllowConfig(
+            title=bool(llm_allow_data.get("title", False)),
+            entities=bool(llm_allow_data.get("entities", False)),
+            source_type=bool(llm_allow_data.get("source_type", False)),
+            priority=bool(llm_allow_data.get("priority", False)),
+        )
         cfg.metadata = MetadataConfig(
             model=str(md.get("model", "")),
             vocab_path=str(md.get("vocab_path", "")),
             extra_allowed_keys=list(md.get("extra_allowed_keys", [])),
             force=bool(md.get("force", False)),
+            include_confidence=bool(md.get("include_confidence", False)),
+            extract_priority_from_tags=bool(md.get("extract_priority_from_tags", False)),
+            llm_allow=llm_allow,
+            private_folders=list(md.get("private_folders", [])),
         )
 
     return cfg

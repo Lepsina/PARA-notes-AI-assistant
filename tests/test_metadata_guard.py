@@ -1,6 +1,6 @@
 """Tests for obsassist.metadata_guard.
 
-Covers all acceptance criteria from PR4:
+Covers all acceptance criteria from PR4 and PR6:
 - body unchanged after metadata update (byte-for-byte)
 - unknown keys removed / ignored
 - alias mapping (topic → topics, complete/in_progress → status canonical)
@@ -8,24 +8,38 @@ Covers all acceptance criteria from PR4:
 - priority extraction from tags (High/Medium/Low)
 - conservative merge preserves existing manual fields
 - metadata model selection + fallback behaviour (via config)
+- PR6: deterministic type/status inference by path and tags
+- PR6: RU-only summary validation (non-RU dropped)
+- PR6: YAML fence stripping
+- PR6: confidence score computation
+- PR6: LLM-restricted keys (title/entities/source_type/priority not written by default)
+- PR6: exclude_from_ai auto-rule for private folders / #private tag
 """
 from __future__ import annotations
 
 import textwrap
+import warnings
 from pathlib import Path
 
 import pytest
 import yaml
 
-from obsassist.config import MetadataConfig, _parse_config
+from obsassist.config import LlmAllowConfig, MetadataConfig, _parse_config
 from obsassist.metadata_guard import (
     ALLOWED_KEYS,
+    LLM_RESTRICTED_KEYS,
     apply_metadata_to_content,
     build_content,
+    compute_confidence,
+    infer_exclude_from_ai,
+    infer_status,
+    infer_type,
+    is_russian,
     load_vocab,
     merge,
     sanitize,
     split_frontmatter,
+    strip_yaml_fences,
 )
 
 # ---------------------------------------------------------------------------
@@ -408,15 +422,15 @@ class TestConservativeMerge:
         original_fm = "title: My Math Note\nstatus: draft\ntags:\n  - матан\n"
         content = _note_with_frontmatter(original_fm, body)
 
-        # LLM suggests updating status and adding summary
-        llm_yaml = "status: active\nsummary: A note about calculus.\ntags:\n  - матан\n  - тейлор\n"
+        # LLM suggests updating status and adding summary (summary in Russian)
+        llm_yaml = "status: active\nsummary: Заметка о математическом анализе.\ntags:\n  - матан\n  - тейлор\n"
         new_content, changed = apply_metadata_to_content(content, llm_yaml)
 
         assert changed is True
         fm, new_body = split_frontmatter(new_content)
         assert new_body == body  # body unchanged
         assert fm["status"] == "draft"  # NOT overwritten
-        assert fm["summary"] == "A note about calculus."  # new field filled
+        assert fm["summary"] == "Заметка о математическом анализе."  # new field filled
 
 
 # ---------------------------------------------------------------------------
@@ -501,3 +515,493 @@ class TestMetadataModelConfig:
         }
         cfg = _parse_config(data)
         assert cfg.embeddings.model == "nomic-embed-text"
+
+
+# ---------------------------------------------------------------------------
+# PR6: Deterministic type inference
+# ---------------------------------------------------------------------------
+
+
+class TestInferType:
+    def test_daily_folder(self):
+        assert infer_type(Path("vault/Daily/2024-01-15.md")) == "daily"
+
+    def test_daily_by_filename_pattern(self):
+        assert infer_type(Path("Notes/2024-05-20 meeting.md")) == "daily"
+
+    def test_daily_filename_at_root(self):
+        assert infer_type(Path("2023-12-31.md")) == "daily"
+
+    def test_projects_folder(self):
+        assert infer_type(Path("vault/Projects/my-project.md")) == "project"
+
+    def test_areas_folder(self):
+        assert infer_type(Path("vault/Areas/health.md")) == "area"
+
+    def test_resources_folder(self):
+        assert infer_type(Path("vault/Resources/book-notes.md")) == "resource"
+
+    def test_buffer_folder(self):
+        assert infer_type(Path("vault/0. Buffer/scratch.md")) == "note"
+
+    def test_unknown_path_defaults_to_note(self):
+        assert infer_type(Path("vault/RandomFolder/note.md")) == "note"
+
+    def test_none_path_defaults_to_note(self):
+        assert infer_type(None) == "note"
+
+    def test_case_insensitive_folder(self):
+        assert infer_type(Path("vault/PROJECTS/task.md")) == "project"
+        assert infer_type(Path("vault/areas/focus.md")) == "area"
+
+    def test_daily_filename_priority_over_projects_folder(self):
+        # date-matching filename beats folder
+        assert infer_type(Path("Projects/2024-01-01-review.md")) == "daily"
+
+
+# ---------------------------------------------------------------------------
+# PR6: Deterministic status inference
+# ---------------------------------------------------------------------------
+
+
+class TestInferStatus:
+    def test_buffer_folder_returns_draft(self):
+        assert infer_status(Path("vault/0. Buffer/idea.md")) == "draft"
+
+    def test_дописать_tag_returns_draft(self):
+        assert infer_status(Path("Notes/note.md"), tags=["дописать"]) == "draft"
+
+    def test_дописать_with_hash_returns_draft(self):
+        assert infer_status(None, tags=["#дописать"]) == "draft"
+
+    def test_просмотреть_tag_returns_active(self):
+        assert infer_status(None, tags=["просмотреть"]) == "active"
+
+    def test_project_folder_returns_active_by_default(self):
+        assert infer_status(Path("vault/Projects/task.md")) == "active"
+
+    def test_area_folder_returns_active_by_default(self):
+        assert infer_status(Path("vault/Areas/health.md")) == "active"
+
+    def test_note_without_special_tags_returns_none(self):
+        assert infer_status(Path("vault/Notes/generic.md")) is None
+
+    def test_resource_folder_returns_none(self):
+        assert infer_status(Path("vault/Resources/book.md")) is None
+
+    def test_buffer_overrides_просмотреть(self):
+        # Buffer folder takes priority; buffer → draft
+        assert infer_status(Path("vault/0. Buffer/note.md"), tags=["просмотреть"]) == "draft"
+
+    def test_none_path_with_no_special_tags_returns_none(self):
+        assert infer_status(None) is None
+
+
+# ---------------------------------------------------------------------------
+# PR6: exclude_from_ai deterministic rule
+# ---------------------------------------------------------------------------
+
+
+class TestInferExcludeFromAi:
+    def test_private_folder_excluded(self):
+        result = infer_exclude_from_ai(
+            Path("vault/Private/diary.md"), private_folders=["Private"]
+        )
+        assert result is True
+
+    def test_people_folder_excluded(self):
+        result = infer_exclude_from_ai(
+            Path("vault/People/friend.md"), private_folders=["People", "Private"]
+        )
+        assert result is True
+
+    def test_private_tag_excluded(self):
+        result = infer_exclude_from_ai(
+            Path("vault/Notes/note.md"),
+            tags=["private"],
+            private_folders=["Private"],
+        )
+        assert result is True
+
+    def test_private_tag_with_hash_excluded(self):
+        result = infer_exclude_from_ai(
+            Path("vault/Notes/note.md"),
+            tags=["#private"],
+            private_folders=["Private"],
+        )
+        assert result is True
+
+    def test_no_private_folder_configured_returns_none(self):
+        # Feature disabled when private_folders is empty/None
+        assert infer_exclude_from_ai(Path("vault/Private/note.md")) is None
+
+    def test_non_private_path_not_excluded(self):
+        result = infer_exclude_from_ai(
+            Path("vault/Projects/task.md"),
+            tags=["work"],
+            private_folders=["Private"],
+        )
+        assert result is None
+
+
+# ---------------------------------------------------------------------------
+# PR6: YAML fence stripping
+# ---------------------------------------------------------------------------
+
+
+class TestStripYamlFences:
+    def test_plain_yaml_unchanged(self):
+        yaml_text = "status: draft\ntags:\n  - test\n"
+        assert strip_yaml_fences(yaml_text) == yaml_text.strip()
+
+    def test_triple_backtick_yaml_fence_stripped(self):
+        fenced = "```yaml\nstatus: draft\ntags:\n  - test\n```"
+        assert strip_yaml_fences(fenced) == "status: draft\ntags:\n  - test"
+
+    def test_triple_backtick_no_lang_stripped(self):
+        fenced = "```\nstatus: draft\n```"
+        assert strip_yaml_fences(fenced) == "status: draft"
+
+    def test_quadruple_backtick_fence_stripped(self):
+        fenced = "````yaml\nstatus: active\n````"
+        assert strip_yaml_fences(fenced) == "status: active"
+
+    def test_content_within_fence_is_exact(self):
+        inner = "tags:\n  - матан\nstatus: draft"
+        fenced = f"```yaml\n{inner}\n```"
+        assert strip_yaml_fences(fenced) == inner
+
+    def test_apply_metadata_accepts_fenced_yaml(self):
+        """apply_metadata_to_content must accept LLM output wrapped in fences."""
+        content = "# Note\n\nBody.\n"
+        fenced_yaml = "```yaml\nstatus: draft\ntags:\n  - test\n```"
+        new_content, changed = apply_metadata_to_content(content, fenced_yaml)
+        assert changed is True
+        fm, _ = split_frontmatter(new_content)
+        assert fm.get("status") == "draft"
+        assert "test" in fm.get("tags", [])
+
+
+# ---------------------------------------------------------------------------
+# PR6: Russian summary heuristic
+# ---------------------------------------------------------------------------
+
+
+class TestIsRussian:
+    def test_russian_text(self):
+        assert is_russian("Заметка о математическом анализе.") is True
+
+    def test_english_text(self):
+        assert is_russian("A note about calculus.") is False
+
+    def test_empty_string(self):
+        assert is_russian("") is False
+
+    def test_mixed_mostly_cyrillic(self):
+        # "Привет мир" = 10 Cyrillic, " ok" = 2 Latin → 10/12 ≈ 83% Cyrillic
+        assert is_russian("Привет мир ok") is True  # >50% Cyrillic
+
+    def test_mixed_mostly_latin(self):
+        # Long Latin sentence with one short Russian word → <50% Cyrillic
+        assert is_russian("This is a long English note about analysis, да") is False
+
+    def test_numbers_only(self):
+        assert is_russian("12345") is False
+
+    def test_non_russian_summary_dropped_from_apply(self):
+        """Non-Russian summary must be dropped and a warning emitted."""
+        content = "# Note\n\nBody.\n"
+        llm_yaml = "summary: A note about calculus.\ntags:\n  - test\n"
+        with warnings.catch_warnings(record=True) as w:
+            warnings.simplefilter("always")
+            new_content, changed = apply_metadata_to_content(content, llm_yaml)
+        assert any("non-Russian" in str(warning.message) for warning in w)
+        fm, _ = split_frontmatter(new_content)
+        assert "summary" not in fm
+
+    def test_russian_summary_preserved_in_apply(self):
+        content = "# Note\n\nBody.\n"
+        llm_yaml = "summary: Заметка о математическом анализе.\ntags:\n  - test\n"
+        new_content, changed = apply_metadata_to_content(content, llm_yaml)
+        fm, _ = split_frontmatter(new_content)
+        assert fm.get("summary") == "Заметка о математическом анализе."
+
+
+# ---------------------------------------------------------------------------
+# PR6: Confidence score
+# ---------------------------------------------------------------------------
+
+
+class TestComputeConfidence:
+    def test_all_checks_pass_score_1(self):
+        score = compute_confidence(
+            yaml_parsed=True,
+            schema_valid=True,
+            body_unchanged=True,
+            type_inferred=True,
+            topics_valid=True,
+            summary_ru=None,
+        )
+        assert score == 1.0
+
+    def test_all_checks_fail_score_0(self):
+        score = compute_confidence(
+            yaml_parsed=False,
+            schema_valid=False,
+            body_unchanged=False,
+            type_inferred=False,
+            topics_valid=False,
+            summary_ru=None,
+        )
+        assert score == 0.0
+
+    def test_with_summary_ru_true(self):
+        score = compute_confidence(
+            yaml_parsed=True,
+            schema_valid=True,
+            body_unchanged=True,
+            type_inferred=True,
+            topics_valid=True,
+            summary_ru=True,
+        )
+        assert score == 1.0
+
+    def test_with_summary_ru_false_lowers_score(self):
+        score = compute_confidence(
+            yaml_parsed=True,
+            schema_valid=True,
+            body_unchanged=True,
+            type_inferred=True,
+            topics_valid=True,
+            summary_ru=False,
+        )
+        assert score < 1.0
+
+    def test_score_has_two_decimal_precision(self):
+        score = compute_confidence(
+            yaml_parsed=True,
+            schema_valid=True,
+            body_unchanged=True,
+            type_inferred=False,
+            topics_valid=True,
+            summary_ru=True,
+        )
+        # 5/6 ≈ 0.83
+        assert score == round(5 / 6, 2)
+
+    def test_include_confidence_in_apply(self):
+        content = "# Note\n\nBody.\n"
+        llm_yaml = "tags:\n  - тест\n"
+        new_content, changed = apply_metadata_to_content(
+            content, llm_yaml,
+            note_path=Path("vault/Projects/note.md"),
+            include_confidence=True,
+        )
+        assert changed is True
+        fm, _ = split_frontmatter(new_content)
+        assert "confidence" in fm
+        conf = fm["confidence"]
+        assert 0.0 <= conf <= 1.0
+
+
+# ---------------------------------------------------------------------------
+# PR6: LLM-restricted keys not written by default
+# ---------------------------------------------------------------------------
+
+
+class TestLlmRestrictedKeys:
+    def test_title_dropped_by_default(self):
+        raw = {"title": "My Note", "status": "draft"}
+        result = sanitize(raw, llm_allowed_keys=frozenset())
+        assert "title" not in result
+
+    def test_entities_dropped_by_default(self):
+        raw = {"entities": ["Person A"], "status": "draft"}
+        result = sanitize(raw, llm_allowed_keys=frozenset())
+        assert "entities" not in result
+
+    def test_source_type_dropped_by_default(self):
+        raw = {"source_type": "book", "status": "draft"}
+        result = sanitize(raw, llm_allowed_keys=frozenset())
+        assert "source_type" not in result
+
+    def test_priority_dropped_by_default(self):
+        raw = {"priority": "high", "status": "draft"}
+        result = sanitize(raw, llm_allowed_keys=frozenset())
+        assert "priority" not in result
+
+    def test_title_allowed_when_permitted(self):
+        raw = {"title": "My Note", "status": "draft"}
+        result = sanitize(raw, llm_allowed_keys=frozenset({"title"}))
+        assert result.get("title") == "My Note"
+
+    def test_entities_allowed_when_permitted(self):
+        raw = {"entities": ["Person A"]}
+        result = sanitize(raw, llm_allowed_keys=frozenset({"entities"}))
+        assert "entities" in result
+
+    def test_no_restriction_when_llm_allowed_keys_is_none(self):
+        """Backward compat: None means restrictions disabled."""
+        raw = {"title": "My Note", "entities": ["X"], "priority": "high"}
+        result = sanitize(raw, llm_allowed_keys=None)
+        assert "title" in result
+        assert "entities" in result
+        assert "priority" in result
+
+    def test_restricted_keys_not_set_via_apply_by_default(self):
+        """apply_metadata_to_content with llm_allowed_keys=frozenset() drops restricted keys."""
+        content = "# Note\n\nBody.\n"
+        llm_yaml = (
+            "title: AI Title\n"
+            "entities:\n  - Person\n"
+            "source_type: article\n"
+            "priority: high\n"
+            "status: draft\n"
+        )
+        new_content, changed = apply_metadata_to_content(
+            content, llm_yaml,
+            llm_allowed_keys=frozenset(),
+        )
+        assert changed is True
+        fm, _ = split_frontmatter(new_content)
+        assert "title" not in fm
+        assert "entities" not in fm
+        assert "source_type" not in fm
+        assert "priority" not in fm
+        assert fm.get("status") == "draft"
+
+
+# ---------------------------------------------------------------------------
+# PR6: Deterministic type/status set via apply_metadata_to_content
+# ---------------------------------------------------------------------------
+
+
+class TestDeterministicInferenceViaApply:
+    def test_type_set_from_path_projects(self):
+        content = "# Note\n\nBody.\n"
+        new_content, changed = apply_metadata_to_content(
+            content, "tags:\n  - work\n",
+            note_path=Path("vault/Projects/task.md"),
+        )
+        assert changed is True
+        fm, _ = split_frontmatter(new_content)
+        assert fm["type"] == "project"
+
+    def test_type_set_from_path_areas(self):
+        content = "# Note\n\nBody.\n"
+        new_content, _ = apply_metadata_to_content(
+            content, "tags:\n  - health\n",
+            note_path=Path("vault/Areas/wellness.md"),
+        )
+        fm, _ = split_frontmatter(new_content)
+        assert fm["type"] == "area"
+
+    def test_type_set_from_daily_filename(self):
+        content = "# Note\n\nBody.\n"
+        new_content, _ = apply_metadata_to_content(
+            content, "tags:\n  - daily\n",
+            note_path=Path("vault/2024-03-15.md"),
+        )
+        fm, _ = split_frontmatter(new_content)
+        assert fm["type"] == "daily"
+
+    def test_buffer_note_gets_status_draft(self):
+        content = "# Note\n\nBody.\n"
+        new_content, _ = apply_metadata_to_content(
+            content, "tags:\n  - idea\n",
+            note_path=Path("vault/0. Buffer/scratch.md"),
+        )
+        fm, _ = split_frontmatter(new_content)
+        assert fm["type"] == "note"
+        assert fm["status"] == "draft"
+
+    def test_project_gets_status_active(self):
+        content = "# Note\n\nBody.\n"
+        new_content, _ = apply_metadata_to_content(
+            content, "tags:\n  - work\n",
+            note_path=Path("vault/Projects/task.md"),
+        )
+        fm, _ = split_frontmatter(new_content)
+        assert fm["status"] == "active"
+
+    def test_дописать_tag_forces_draft_even_in_projects(self):
+        content = "# Note\n\nBody.\n"
+        new_content, _ = apply_metadata_to_content(
+            content, "tags:\n  - дописать\n",
+            note_path=Path("vault/Projects/unfinished.md"),
+        )
+        fm, _ = split_frontmatter(new_content)
+        # дописать tag → draft, overrides project default of active
+        assert fm.get("status") == "draft"
+
+    def test_exclude_from_ai_set_for_private_folder(self):
+        content = "# Note\n\nBody.\n"
+        new_content, _ = apply_metadata_to_content(
+            content, "tags:\n  - personal\n",
+            note_path=Path("vault/Private/diary.md"),
+            private_folders=["Private"],
+        )
+        fm, _ = split_frontmatter(new_content)
+        assert fm.get("exclude_from_ai") is True
+
+    def test_type_not_set_when_no_path(self):
+        content = "# Note\n\nBody.\n"
+        llm_yaml = "status: draft\ntags:\n  - test\n"
+        new_content, _ = apply_metadata_to_content(content, llm_yaml)
+        fm, _ = split_frontmatter(new_content)
+        assert "type" not in fm
+
+
+# ---------------------------------------------------------------------------
+# PR6: Config parsing for new fields
+# ---------------------------------------------------------------------------
+
+
+class TestMetadataConfigPR6:
+    def test_include_confidence_default_false(self):
+        cfg = _parse_config({})
+        assert cfg.metadata.include_confidence is False
+
+    def test_include_confidence_parsed(self):
+        cfg = _parse_config({"metadata": {"include_confidence": True}})
+        assert cfg.metadata.include_confidence is True
+
+    def test_extract_priority_from_tags_default_false(self):
+        cfg = _parse_config({})
+        assert cfg.metadata.extract_priority_from_tags is False
+
+    def test_extract_priority_from_tags_parsed(self):
+        cfg = _parse_config({"metadata": {"extract_priority_from_tags": True}})
+        assert cfg.metadata.extract_priority_from_tags is True
+
+    def test_llm_allow_defaults_all_false(self):
+        cfg = _parse_config({})
+        la = cfg.metadata.llm_allow
+        assert la.title is False
+        assert la.entities is False
+        assert la.source_type is False
+        assert la.priority is False
+
+    def test_llm_allow_title_parsed(self):
+        cfg = _parse_config({"metadata": {"llm_allow": {"title": True}}})
+        assert cfg.metadata.llm_allow.title is True
+
+    def test_llm_allow_entities_parsed(self):
+        cfg = _parse_config({"metadata": {"llm_allow": {"entities": True}}})
+        assert cfg.metadata.llm_allow.entities is True
+
+    def test_private_folders_default_empty(self):
+        cfg = _parse_config({})
+        assert cfg.metadata.private_folders == []
+
+    def test_private_folders_parsed(self):
+        cfg = _parse_config({"metadata": {"private_folders": ["Private", "People"]}})
+        assert cfg.metadata.private_folders == ["Private", "People"]
+
+    def test_exclude_from_ai_alias_in_sanitize(self):
+        """exclude-from-ai hyphenated alias must be renamed to exclude_from_ai."""
+        raw = {"exclude-from-ai": True}
+        result = sanitize(raw)
+        assert "exclude_from_ai" in result
+        assert result["exclude_from_ai"] is True
+        assert "exclude-from-ai" not in result
