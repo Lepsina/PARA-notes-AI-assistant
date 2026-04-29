@@ -77,6 +77,24 @@ STATUS_ALIASES: dict[str, str] = {
 }
 
 # ---------------------------------------------------------------------------
+# Numbered-prefix helper (supports "N. FolderName" PARA vault layout)
+# ---------------------------------------------------------------------------
+
+# Matches an optional leading "N. " prefix on a (already lower-cased) path segment
+_NUMBERED_PREFIX_RE = re.compile(r"^\d+\.\s+")
+
+
+def _strip_numbered_prefix(part: str) -> str:
+    """Remove an optional ``N. `` numeric prefix from a path segment.
+
+    Handles both plain folder names (``projects``) and the numbered PARA
+    layout (``1. projects``, ``2. areas``, ``0. buffer``, …).
+    """
+    m = _NUMBERED_PREFIX_RE.match(part)
+    return part[m.end():] if m else part
+
+
+# ---------------------------------------------------------------------------
 # Deterministic type inference
 # ---------------------------------------------------------------------------
 
@@ -88,12 +106,15 @@ def infer_type(note_path: Path | str | None) -> str:
     """Infer the ``type`` frontmatter value deterministically from *note_path*.
 
     Rules (checked in order against the **resolved** path parts):
-    - ``Daily/`` folder **or** filename matches ``YYYY-MM-DD*``  → ``daily``
-    - ``Projects/`` folder                                        → ``project``
-    - ``Areas/`` folder                                           → ``area``
-    - ``Resources/`` folder                                       → ``resource``
-    - ``0. Buffer/`` folder                                       → ``note``
-    - anything else                                               → ``note``
+    - ``Daily/`` folder **or** filename matches ``YYYY-MM-DD*``     → ``daily``
+    - ``Projects/`` or ``1. Projects/`` folder                       → ``project``
+    - ``Areas/`` or ``2. Areas/`` folder                             → ``area``
+    - ``Resources/`` or ``3. Resources/`` folder                     → ``resource``
+    - ``Buffer/`` or ``0. Buffer/`` folder                           → ``note``
+    - anything else                                                   → ``note``
+
+    The ``N. `` numeric prefix is stripped before comparison so that both
+    plain (``Projects/``) and numbered (``1. Projects/``) vault layouts work.
     """
     if note_path is None:
         return "note"
@@ -106,13 +127,14 @@ def infer_type(note_path: Path | str | None) -> str:
         return "daily"
 
     for part in parts:
-        if part == "daily":
+        normalized = _strip_numbered_prefix(part)
+        if normalized == "daily":
             return "daily"
-        if part == "projects":
+        if normalized == "projects":
             return "project"
-        if part == "areas":
+        if normalized == "areas":
             return "area"
-        if part == "resources":
+        if normalized == "resources":
             return "resource"
 
     return "note"
@@ -127,6 +149,9 @@ _DRAFT_TAGS: frozenset[str] = frozenset({"дописать", "#дописать"
 # Tags that force status = active
 _ACTIVE_TAGS: frozenset[str] = frozenset({"просмотреть", "#просмотреть"})
 
+# Only these values may appear in the ``status`` field.
+ALLOWED_STATUSES: frozenset[str] = frozenset({"draft", "active", "done", "archived"})
+
 
 def infer_status(
     note_path: Path | str | None,
@@ -139,19 +164,19 @@ def infer_status(
     Returns ``None`` when no status should be set (caller should omit the field).
 
     Rules:
-    - In ``0. Buffer/``   → ``draft`` (regardless of tags)
-    - tag ``#дописать``   → ``draft``
-    - tag ``#просмотреть``→ ``active``
-    - type project/area   → *default_project_area_status* (``active``)
-    - otherwise           → ``None`` (do not set)
+    - In ``Buffer/`` or ``0. Buffer/`` → ``draft`` (regardless of tags)
+    - tag ``#дописать``                → ``draft``
+    - tag ``#просмотреть``             → ``active``
+    - type project/area                → *default_project_area_status* (``active``)
+    - otherwise                        → ``None`` (do not set)
     """
     path = Path(note_path) if note_path else None
 
-    # 0. Buffer → draft
+    # Buffer folder → draft (supports both plain and numbered form)
     if path is not None:
         parts_lower = [p.lower() for p in path.parts]
         for part in parts_lower:
-            if part.startswith("0.") and "buffer" in part:
+            if _strip_numbered_prefix(part) == "buffer":
                 return "draft"
 
     # Tag-based overrides
@@ -265,6 +290,35 @@ def is_russian(text: str) -> bool:
         return False
     cyrillic_chars = _CYRILLIC_RE.findall(text)
     return len(cyrillic_chars) / len(alpha_chars) >= _RU_CYRILLIC_RATIO_THRESHOLD
+
+
+# ---------------------------------------------------------------------------
+# Boilerplate summary denylist
+# ---------------------------------------------------------------------------
+
+# Patterns that indicate a hallucinated / boilerplate LLM summary
+_SUMMARY_BOILERPLATE_RES: list[re.Pattern[str]] = [
+    # "Создана заметка…" — most common hallucination
+    re.compile(r"создан[аы]?\s+заметк[аи]", re.IGNORECASE),
+    # "заметка создан…"
+    re.compile(r"заметк[аи]\s+создан[аы]?", re.IGNORECASE),
+    # "для дальнейшего анализа в системе"
+    re.compile(r"для\s+дальнейшего\s+анализ[аа]\s+в\s+систем", re.IGNORECASE),
+    # "метаданные для … Obsidian"
+    re.compile(r"метаданн[ыые]+\s+для\s+.{0,40}obsidian", re.IGNORECASE),
+]
+
+
+def is_boilerplate_summary(text: str) -> bool:
+    """Return ``True`` when *text* matches a known hallucinated boilerplate pattern.
+
+    Use this to drop LLM summaries that are generic filler rather than an
+    actual description of the note content.
+    """
+    for pattern in _SUMMARY_BOILERPLATE_RES:
+        if pattern.search(text):
+            return True
+    return False
 
 
 # ---------------------------------------------------------------------------
@@ -425,10 +479,19 @@ def sanitize(
         if field in result:
             result[field] = bool(result[field])
 
-    # Step 5: normalise status
+    # Step 5: normalise status and enforce allowed set
     if "status" in result:
         s = str(result["status"]).strip().lower()
-        result["status"] = STATUS_ALIASES.get(s, s)
+        s = STATUS_ALIASES.get(s, s)
+        if s not in ALLOWED_STATUSES:
+            warnings.warn(
+                f"obsassist: status '{result['status']}' is not allowed "
+                f"(allowed: {', '.join(sorted(ALLOWED_STATUSES))}); removing field.",
+                stacklevel=2,
+            )
+            del result["status"]
+        else:
+            result["status"] = s
 
     # Step 6: vocab normalisation
     if vocab:
@@ -578,6 +641,7 @@ def apply_metadata_to_content(
     llm_allowed_keys: frozenset[str] | set[str] | None = None,
     include_confidence: bool = False,
     private_folders: list[str] | None = None,
+    summary_for_daily: bool = False,
 ) -> tuple[str, bool]:
     """Parse LLM YAML, sanitise, merge into note frontmatter, return new content.
 
@@ -603,8 +667,30 @@ def apply_metadata_to_content(
     private_folders:
         Folder names that trigger ``exclude_from_ai: true`` (e.g. ``Private``,
         ``People``).
+    summary_for_daily:
+        When ``False`` (default), the ``summary`` field is suppressed for notes
+        whose inferred type is ``daily``.  Set to ``True`` to allow summaries on
+        daily notes.
     """
     existing_fm, body = split_frontmatter(content)
+
+    # Validate existing frontmatter status — remove invalid values with a warning.
+    fm_was_cleaned = False
+    if "status" in existing_fm:
+        existing_status = str(existing_fm["status"]).strip().lower()
+        existing_status = STATUS_ALIASES.get(existing_status, existing_status)
+        if existing_status not in ALLOWED_STATUSES:
+            warnings.warn(
+                f"obsassist: existing status '{existing_fm['status']}' is not in the "
+                f"allowed set ({', '.join(sorted(ALLOWED_STATUSES))}); removing field.",
+                stacklevel=2,
+            )
+            existing_fm = {k: v for k, v in existing_fm.items() if k != "status"}
+            fm_was_cleaned = True
+        elif existing_status != existing_fm["status"]:
+            existing_fm = dict(existing_fm)
+            existing_fm["status"] = existing_status
+            fm_was_cleaned = True
 
     # Strip markdown fences before parsing
     clean_yaml = strip_yaml_fences(llm_yaml)
@@ -631,6 +717,9 @@ def apply_metadata_to_content(
         llm_allowed_keys=llm_allowed_keys,
     )
 
+    # Status is always deterministic — LLM is not allowed to set it.
+    sanitized.pop("status", None)
+
     # --------------------------------------------------------------------------
     # Deterministic overrides (not from LLM)
     # Only applied when note_path is provided; otherwise we stay backward-
@@ -647,11 +736,10 @@ def apply_metadata_to_content(
         sanitized["type"] = inferred_type
         type_inferred = True
 
-        # status: set deterministically; only applied when absent or force
+        # status: set deterministically; LLM value has already been stripped
         inferred_status = infer_status(note_path, tags=tags_for_inference)
         if inferred_status is not None:
-            if "status" not in sanitized:
-                sanitized["status"] = inferred_status
+            sanitized["status"] = inferred_status
 
         # exclude_from_ai: deterministic private-folder rule
         if private_folders:
@@ -661,20 +749,34 @@ def apply_metadata_to_content(
                 sanitized["exclude_from_ai"] = True
 
     # --------------------------------------------------------------------------
-    # Confidence score
+    # Summary guards
     # --------------------------------------------------------------------------
     topics_valid = True
     summary_ru: bool | None = None
     if "summary" in sanitized:
-        summary_ru = is_russian(str(sanitized["summary"]))
-        if not summary_ru:
-            # Drop non-Russian summary; caller should handle retry
-            warnings.warn(
-                "obsassist: LLM summary appears non-Russian; dropping field.",
-                stacklevel=2,
-            )
+        # Suppress summary for daily notes (configurable)
+        current_type = sanitized.get("type") or existing_fm.get("type")
+        if current_type == "daily" and not summary_for_daily:
             del sanitized["summary"]
-            summary_ru = None  # not counted in confidence (was omitted)
+        else:
+            # Check for hallucinated boilerplate before the Russian check
+            summary_text = str(sanitized["summary"])
+            if is_boilerplate_summary(summary_text):
+                warnings.warn(
+                    "obsassist: LLM summary matches boilerplate denylist; dropping field.",
+                    stacklevel=2,
+                )
+                del sanitized["summary"]
+            else:
+                summary_ru = is_russian(summary_text)
+                if not summary_ru:
+                    # Drop non-Russian summary; caller should handle retry
+                    warnings.warn(
+                        "obsassist: LLM summary appears non-Russian; dropping field.",
+                        stacklevel=2,
+                    )
+                    del sanitized["summary"]
+                    summary_ru = None  # not counted in confidence (was omitted)
 
     if include_confidence:
         conf = compute_confidence(
@@ -689,7 +791,12 @@ def apply_metadata_to_content(
 
     merged, changed = merge(existing_fm, sanitized, force=force)
 
-    if not changed:
+    if not changed and not fm_was_cleaned:
         return content, False
+
+    if not changed and fm_was_cleaned:
+        # The only change is removal of an invalid status value; rebuild from
+        # the cleaned existing_fm without touching the 'updated' timestamp.
+        return build_content(existing_fm, body), True
 
     return build_content(merged, body), True

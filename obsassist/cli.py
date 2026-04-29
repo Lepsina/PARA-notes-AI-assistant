@@ -212,6 +212,7 @@ def _llm_process_file(
     llm_allowed_keys: frozenset[str] | None = None,
     include_confidence: bool = False,
     private_folders: list[str] | None = None,
+    summary_for_daily: bool = False,
 ) -> tuple[str, str, bool, str | None]:
     """Read a note, call the LLM, and compute new content.
 
@@ -257,6 +258,7 @@ def _llm_process_file(
             llm_allowed_keys=llm_allowed_keys,
             include_confidence=include_confidence,
             private_folders=private_folders,
+            summary_for_daily=summary_for_daily,
         )
     except ValueError as exc:
         return original, original, False, f"validation error: {exc}"
@@ -432,6 +434,7 @@ def metadata_update(file_path: str, yes: bool, config_path: str | None, force: b
             llm_allowed_keys=llm_allowed,
             include_confidence=cfg.metadata.include_confidence,
             private_folders=cfg.metadata.private_folders or None,
+            summary_for_daily=cfg.metadata.summary_for_daily,
         )
     except ValueError as exc:
         console.print(f"[red]Metadata validation error:[/red] {exc}")
@@ -775,6 +778,7 @@ def metadata_apply(
                     llm_allowed_keys=llm_allowed,
                     include_confidence=cfg.metadata.include_confidence,
                     private_folders=cfg.metadata.private_folders or None,
+                    summary_for_daily=cfg.metadata.summary_for_daily,
                 )
             _handle_result(md_path, *result)
             if batch_size > 0 and (i + 1) % batch_size == 0:
@@ -792,6 +796,7 @@ def metadata_apply(
                     llm_allowed_keys=llm_allowed,
                     include_confidence=cfg.metadata.include_confidence,
                     private_folders=cfg.metadata.private_folders or None,
+                    summary_for_daily=cfg.metadata.summary_for_daily,
                 )
                 for md_path in selected
             ]

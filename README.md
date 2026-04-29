@@ -202,7 +202,7 @@ Overwrites all existing frontmatter fields with the LLM suggestions (full regene
 | `created` | string | Creation date (`YYYY-MM-DD`) |
 | `updated` | string | Last update date (auto-set on change) |
 | `type` | string | **Set deterministically** from file path (see below) |
-| `status` | string | `draft` \| `active` \| `done` — inferred deterministically |
+| `status` | string | `draft` \| `active` \| `done` \| `archived` — inferred deterministically; **LLM cannot set this field** |
 | `lang` | string | Language code |
 | `tags` | list | Original tags preserved |
 | `topics` | list | Canonical topics (normalised via vocab) |
@@ -221,24 +221,27 @@ Keys **not** in this list are discarded unless added via `extra_allowed_keys` in
 
 #### Deterministic `type` inference
 
-`type` is always derived from the file path — the LLM cannot override it:
+`type` is always derived from the file path — the LLM cannot override it.
+Both plain folder names (`Projects/`) and the numbered PARA layout (`1. Projects/`) are supported:
 
 | Path condition | `type` value |
 |---|---|
 | `Daily/` folder **or** filename matches `YYYY-MM-DD*` | `daily` |
-| `Projects/` folder | `project` |
-| `Areas/` folder | `area` |
-| `Resources/` folder | `resource` |
-| `0. Buffer/` folder | `note` |
+| `Projects/` **or** `1. Projects/` folder | `project` |
+| `Areas/` **or** `2. Areas/` folder | `area` |
+| `Resources/` **or** `3. Resources/` folder | `resource` |
+| `Buffer/` **or** `0. Buffer/` folder | `note` |
 | everything else | `note` |
 
 #### Deterministic `status` inference
 
-`status` is also inferred deterministically (LLM suggestion is ignored when a rule applies):
+`status` is **always** inferred deterministically — the LLM cannot set it.
+Only the following values are allowed: `draft`, `active`, `done`, `archived`.
+Any other value found in existing frontmatter (e.g. `published`) is removed with a warning.
 
 | Condition | `status` |
 |---|---|
-| Path is inside `0. Buffer/` | `draft` |
+| Path is inside `Buffer/` or `0. Buffer/` | `draft` |
 | Note contains tag `#дописать` | `draft` |
 | Note contains tag `#просмотреть` | `active` |
 | Note type is `project` or `area` | `active` (configurable) |
@@ -250,6 +253,17 @@ The `summary` field must be in Russian.  If the LLM returns a non-Russian summar
 
 1. A single retry is made with a stricter Russian-language instruction.
 2. If the retry still returns non-Russian, `summary` is omitted and a warning is emitted.
+
+Summaries that match a boilerplate denylist (e.g. *"Создана заметка с метаданными…"*) are
+also dropped automatically.
+
+By default, `summary` is **not generated for `type: daily` notes** (to prevent hallucinations
+on checklist-heavy journal entries).  Enable per-daily summaries with:
+
+```yaml
+metadata:
+  summary_for_daily: true
+```
 
 #### `confidence` score
 
