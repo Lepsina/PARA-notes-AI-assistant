@@ -277,7 +277,6 @@ _ALPHA_RE = re.compile(r"[^\W\d_]", re.UNICODE)
 _RU_CYRILLIC_RATIO_THRESHOLD = 0.5  # ≥50 % of alpha chars must be Cyrillic
 
 
-
 def is_russian(text: str) -> bool:
     """Return ``True`` when *text* contains predominantly Cyrillic characters.
 
