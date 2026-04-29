@@ -60,6 +60,9 @@ class MetadataConfig:
     # Folder names whose notes are auto-marked exclude_from_ai: true.
     # Empty list = feature disabled (conservative default).
     private_folders: list[str] = field(default_factory=list)
+    # When False (default), summary is suppressed for type: daily notes.
+    # Set to True to allow LLM-generated summaries on daily notes.
+    summary_for_daily: bool = False
 
 
 @dataclass
@@ -187,6 +190,7 @@ def _parse_config(data: dict[str, Any]) -> Config:
             extract_priority_from_tags=bool(md.get("extract_priority_from_tags", False)),
             llm_allow=llm_allow,
             private_folders=list(md.get("private_folders", [])),
+            summary_for_daily=bool(md.get("summary_for_daily", False)),
         )
 
     return cfg

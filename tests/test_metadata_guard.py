@@ -1,6 +1,6 @@
 """Tests for obsassist.metadata_guard.
 
-Covers all acceptance criteria from PR4 and PR6:
+Covers all acceptance criteria from PR4, PR6, and PR7 (hotfix):
 - body unchanged after metadata update (byte-for-byte)
 - unknown keys removed / ignored
 - alias mapping (topic → topics, complete/in_progress → status canonical)
@@ -14,6 +14,11 @@ Covers all acceptance criteria from PR4 and PR6:
 - PR6: confidence score computation
 - PR6: LLM-restricted keys (title/entities/source_type/priority not written by default)
 - PR6: exclude_from_ai auto-rule for private folders / #private tag
+- PR7: type inference for numbered PARA folders (0. Buffer, 1. Projects, 2. Areas, 3. Resources)
+- PR7: status enum enforcement (allowed: draft/active/done/archived)
+- PR7: LLM-suggested status is always ignored (status is deterministic-only)
+- PR7: daily notes do not receive summary by default
+- PR7: boilerplate summary denylist
 """
 from __future__ import annotations
 
@@ -27,6 +32,7 @@ import yaml
 from obsassist.config import LlmAllowConfig, MetadataConfig, _parse_config
 from obsassist.metadata_guard import (
     ALLOWED_KEYS,
+    ALLOWED_STATUSES,
     LLM_RESTRICTED_KEYS,
     apply_metadata_to_content,
     build_content,
@@ -34,6 +40,7 @@ from obsassist.metadata_guard import (
     infer_exclude_from_ai,
     infer_status,
     infer_type,
+    is_boilerplate_summary,
     is_russian,
     load_vocab,
     merge,
@@ -674,11 +681,13 @@ class TestStripYamlFences:
     def test_apply_metadata_accepts_fenced_yaml(self):
         """apply_metadata_to_content must accept LLM output wrapped in fences."""
         content = "# Note\n\nBody.\n"
+        # status in LLM YAML is stripped (LLM cannot set status); tags pass through
         fenced_yaml = "```yaml\nstatus: draft\ntags:\n  - test\n```"
         new_content, changed = apply_metadata_to_content(content, fenced_yaml)
         assert changed is True
         fm, _ = split_frontmatter(new_content)
-        assert fm.get("status") == "draft"
+        # status is not set — LLM suggestion is always stripped, no path → no deterministic rule
+        assert "status" not in fm
         assert "test" in fm.get("tags", [])
 
 
@@ -857,6 +866,7 @@ class TestLlmRestrictedKeys:
             "source_type: article\n"
             "priority: high\n"
             "status: draft\n"
+            "lang: ru\n"          # non-restricted key — ensures changed=True
         )
         new_content, changed = apply_metadata_to_content(
             content, llm_yaml,
@@ -868,7 +878,9 @@ class TestLlmRestrictedKeys:
         assert "entities" not in fm
         assert "source_type" not in fm
         assert "priority" not in fm
-        assert fm.get("status") == "draft"
+        # status is always stripped from LLM output regardless of llm_allowed_keys
+        assert "status" not in fm
+        assert fm.get("lang") == "ru"
 
 
 # ---------------------------------------------------------------------------
@@ -1005,3 +1017,313 @@ class TestMetadataConfigPR6:
         assert "exclude_from_ai" in result
         assert result["exclude_from_ai"] is True
         assert "exclude-from-ai" not in result
+
+
+# ---------------------------------------------------------------------------
+# PR7: Numbered PARA folder type inference regression tests
+# ---------------------------------------------------------------------------
+
+
+class TestInferTypeNumberedFolders:
+    """Regression: infer_type must handle numbered PARA vault layouts."""
+
+    def test_numbered_projects_folder(self):
+        assert infer_type(Path("vault/1. Projects/my-task.md")) == "project"
+
+    def test_numbered_areas_folder(self):
+        assert infer_type(Path("vault/2. Areas/health.md")) == "area"
+
+    def test_numbered_resources_folder(self):
+        assert infer_type(Path("vault/3. Resources/book.md")) == "resource"
+
+    def test_numbered_buffer_folder(self):
+        assert infer_type(Path("vault/0. Buffer/scratch.md")) == "note"
+
+    def test_numbered_daily_folder(self):
+        assert infer_type(Path("vault/4. Daily/2024-01-15.md")) == "daily"
+
+    def test_nested_under_numbered_projects(self):
+        assert infer_type(Path("vault/1. Projects/blockchain/task.md")) == "project"
+
+    def test_nested_under_numbered_areas(self):
+        assert infer_type(Path("vault/2. Areas/работа/blockchain/note.md")) == "area"
+
+    def test_plain_and_numbered_are_equivalent(self):
+        """Plain folder names and numbered variants must produce the same type."""
+        assert infer_type(Path("Projects/task.md")) == infer_type(
+            Path("1. Projects/task.md")
+        )
+        assert infer_type(Path("Areas/health.md")) == infer_type(
+            Path("2. Areas/health.md")
+        )
+        assert infer_type(Path("Resources/book.md")) == infer_type(
+            Path("3. Resources/book.md")
+        )
+
+    def test_daily_filename_still_beats_numbered_folder(self):
+        """Date-named file inside numbered Projects → daily (filename priority)."""
+        assert infer_type(Path("1. Projects/2024-01-01-review.md")) == "daily"
+
+
+# ---------------------------------------------------------------------------
+# PR7: Status enum enforcement
+# ---------------------------------------------------------------------------
+
+
+class TestAllowedStatuses:
+    def test_allowed_statuses_set(self):
+        assert ALLOWED_STATUSES == frozenset({"draft", "active", "done", "archived"})
+
+    def test_published_removed_from_sanitize(self):
+        """'published' is not an allowed status — sanitize must drop it with a warning."""
+        raw = {"status": "published", "tags": ["blockchain"]}
+        with warnings.catch_warnings(record=True) as w:
+            warnings.simplefilter("always")
+            result = sanitize(raw)
+        assert "status" not in result
+        assert any("published" in str(warning.message) for warning in w)
+
+    def test_unknown_status_removed_with_warning(self):
+        raw = {"status": "wip"}
+        with warnings.catch_warnings(record=True) as w:
+            warnings.simplefilter("always")
+            result = sanitize(raw)
+        assert "status" not in result
+        assert w  # at least one warning emitted
+
+    def test_valid_statuses_pass_through_sanitize(self):
+        for s in ("draft", "active", "done", "archived"):
+            result = sanitize({"status": s})
+            assert result["status"] == s
+
+    def test_archived_is_allowed(self):
+        result = sanitize({"status": "archived"})
+        assert result["status"] == "archived"
+
+    def test_existing_invalid_status_removed_in_apply(self):
+        """If existing frontmatter has status: published, it must be removed."""
+        content = "---\nstatus: published\ntags:\n  - blockchain\n---\n# Note\n\nBody.\n"
+        with warnings.catch_warnings(record=True) as w:
+            warnings.simplefilter("always")
+            new_content, _ = apply_metadata_to_content(
+                content, "tags:\n  - blockchain\n"
+            )
+        fm, _ = split_frontmatter(new_content)
+        assert "status" not in fm or fm.get("status") in ALLOWED_STATUSES
+        assert any("published" in str(warning.message) for warning in w)
+
+
+# ---------------------------------------------------------------------------
+# PR7: LLM-suggested status is always ignored
+# ---------------------------------------------------------------------------
+
+
+class TestLlmStatusIgnored:
+    def test_llm_active_status_stripped(self):
+        """LLM suggesting status: active must be stripped when no note_path given."""
+        content = "# Note\n\nBody.\n"
+        new_content, _ = apply_metadata_to_content(
+            content, "status: active\ntags:\n  - work\n"
+        )
+        fm, _ = split_frontmatter(new_content)
+        assert "status" not in fm
+
+    def test_llm_draft_status_stripped(self):
+        content = "# Note\n\nBody.\n"
+        new_content, _ = apply_metadata_to_content(
+            content, "status: draft\ntags:\n  - test\n"
+        )
+        fm, _ = split_frontmatter(new_content)
+        assert "status" not in fm
+
+    def test_llm_published_status_stripped(self):
+        """LLM suggesting invalid status published — must be stripped."""
+        content = "# Note\n\nBody.\n"
+        with warnings.catch_warnings(record=True):
+            warnings.simplefilter("always")
+            new_content, _ = apply_metadata_to_content(
+                content, "status: published\ntags:\n  - blockchain\n"
+            )
+        fm, _ = split_frontmatter(new_content)
+        assert "status" not in fm
+
+    def test_deterministic_status_beats_llm(self):
+        """Buffer note must get draft even if LLM had suggested active."""
+        content = "# Note\n\nBody.\n"
+        new_content, _ = apply_metadata_to_content(
+            content, "status: active\ntags:\n  - test\n",
+            note_path=Path("vault/0. Buffer/scratch.md"),
+        )
+        fm, _ = split_frontmatter(new_content)
+        assert fm["status"] == "draft"
+
+    def test_numbered_buffer_gets_draft_not_llm_value(self):
+        """Numbered 0. Buffer folder must still yield draft status."""
+        content = "# Note\n\nBody.\n"
+        new_content, _ = apply_metadata_to_content(
+            content, "status: active\ntags:\n  - idea\n",
+            note_path=Path("vault/0. Buffer/idea.md"),
+        )
+        fm, _ = split_frontmatter(new_content)
+        assert fm["status"] == "draft"
+
+    def test_numbered_projects_gets_active_status(self):
+        """Notes in 1. Projects must get status: active deterministically."""
+        content = "# Note\n\nBody.\n"
+        new_content, _ = apply_metadata_to_content(
+            content, "status: published\ntags:\n  - work\n",
+            note_path=Path("vault/1. Projects/task.md"),
+        )
+        fm, _ = split_frontmatter(new_content)
+        assert fm["status"] == "active"
+
+
+# ---------------------------------------------------------------------------
+# PR7: Daily summary disabled by default
+# ---------------------------------------------------------------------------
+
+
+class TestDailySummaryDefault:
+    def test_daily_summary_suppressed_by_default(self):
+        """summary must be dropped for daily notes when summary_for_daily=False."""
+        content = "# Daily\n\n- [ ] Task one\n- [x] Task two\n"
+        llm_yaml = "summary: Продуктивный день.\ntags:\n  - daily\n"
+        new_content, _ = apply_metadata_to_content(
+            content, llm_yaml,
+            note_path=Path("vault/Daily/2024-03-15.md"),
+        )
+        fm, _ = split_frontmatter(new_content)
+        assert "summary" not in fm
+
+    def test_daily_summary_allowed_when_enabled(self):
+        """summary must be kept for daily notes when summary_for_daily=True."""
+        content = "# Daily\n\nLong journal entry.\n"
+        llm_yaml = "summary: Продуктивный день, решил задачу.\ntags:\n  - daily\n"
+        new_content, _ = apply_metadata_to_content(
+            content, llm_yaml,
+            note_path=Path("vault/Daily/2024-03-15.md"),
+            summary_for_daily=True,
+        )
+        fm, _ = split_frontmatter(new_content)
+        assert fm.get("summary") == "Продуктивный день, решил задачу."
+
+    def test_daily_by_filename_summary_suppressed(self):
+        """Date-named file without Daily folder — summary still suppressed."""
+        content = "# 2024-03-15\n\n- [ ] stuff\n"
+        llm_yaml = "summary: Обычный день.\ntags:\n  - daily\n"
+        new_content, _ = apply_metadata_to_content(
+            content, llm_yaml,
+            note_path=Path("vault/2024-03-15.md"),
+        )
+        fm, _ = split_frontmatter(new_content)
+        assert "summary" not in fm
+
+    def test_non_daily_summary_not_suppressed(self):
+        """Project notes should still receive summaries."""
+        content = "# Project note\n\nDetailed content.\n"
+        llm_yaml = "summary: Описание проекта по блокчейну.\ntags:\n  - work\n"
+        new_content, _ = apply_metadata_to_content(
+            content, llm_yaml,
+            note_path=Path("vault/1. Projects/blockchain.md"),
+        )
+        fm, _ = split_frontmatter(new_content)
+        assert fm.get("summary") == "Описание проекта по блокчейну."
+
+    def test_summary_for_daily_config_flag(self):
+        """Config flag summary_for_daily defaults to False and can be set True."""
+        cfg_default = _parse_config({})
+        assert cfg_default.metadata.summary_for_daily is False
+
+        cfg_enabled = _parse_config({"metadata": {"summary_for_daily": True}})
+        assert cfg_enabled.metadata.summary_for_daily is True
+
+
+# ---------------------------------------------------------------------------
+# PR7: Boilerplate summary denylist
+# ---------------------------------------------------------------------------
+
+
+class TestBoilerplateSummary:
+    def test_created_note_boilerplate_detected(self):
+        assert is_boilerplate_summary("Создана заметка с метаданными.") is True
+
+    def test_created_metadata_obsidian_boilerplate(self):
+        assert is_boilerplate_summary(
+            "Создана заметка с метаданными для дальнейшего анализа в системе Obsidian."
+        ) is True
+
+    def test_real_summary_not_detected_as_boilerplate(self):
+        assert is_boilerplate_summary(
+            "Calldata — неизменяемая область данных, передаваемая в смарт-контракт."
+        ) is False
+
+    def test_boilerplate_summary_dropped_in_apply(self):
+        content = "# Note\n\nBody.\n"
+        llm_yaml = (
+            "summary: Создана заметка с метаданными для дальнейшего анализа в системе Obsidian.\n"
+            "tags:\n  - test\n"
+        )
+        with warnings.catch_warnings(record=True) as w:
+            warnings.simplefilter("always")
+            new_content, _ = apply_metadata_to_content(content, llm_yaml)
+        fm, _ = split_frontmatter(new_content)
+        assert "summary" not in fm
+        assert any("boilerplate" in str(warning.message) for warning in w)
+
+    def test_legitimate_summary_preserved_in_apply(self):
+        content = "# Note\n\nBody.\n"
+        llm_yaml = "summary: Подробный анализ алгоритма BFS.\ntags:\n  - test\n"
+        new_content, _ = apply_metadata_to_content(content, llm_yaml)
+        fm, _ = split_frontmatter(new_content)
+        assert fm.get("summary") == "Подробный анализ алгоритма BFS."
+
+
+# ---------------------------------------------------------------------------
+# PR7: Integration — sample paths produce expected type + status
+# ---------------------------------------------------------------------------
+
+
+class TestSamplePathIntegration:
+    """End-to-end: run apply_metadata_to_content on typical vault paths."""
+
+    def _apply(self, path_str: str, llm_yaml: str = "tags:\n  - test\n") -> dict:
+        content = "# Note\n\nBody.\n"
+        new_content, _ = apply_metadata_to_content(
+            content, llm_yaml, note_path=Path(path_str)
+        )
+        fm, _ = split_frontmatter(new_content)
+        return fm
+
+    def test_numbered_projects_path(self):
+        fm = self._apply("vault/1. Projects/ethereum.md")
+        assert fm["type"] == "project"
+        assert fm["status"] == "active"
+
+    def test_numbered_areas_path(self):
+        fm = self._apply("vault/2. Areas/работа/blockchain/calldata.md")
+        assert fm["type"] == "area"
+        assert fm["status"] == "active"
+
+    def test_numbered_resources_path(self):
+        fm = self._apply("vault/3. Resources/book.md")
+        assert fm["type"] == "resource"
+        assert "status" not in fm  # resource has no default status
+
+    def test_numbered_buffer_path(self):
+        fm = self._apply("vault/0. Buffer/проблемы.md")
+        assert fm["type"] == "note"
+        assert fm["status"] == "draft"
+
+    def test_daily_path(self):
+        fm = self._apply("vault/2026-04-21.md")
+        assert fm["type"] == "daily"
+        assert "status" not in fm
+
+    def test_llm_status_published_never_written(self):
+        """Ensure 'published' can never end up in the output."""
+        fm = self._apply(
+            "vault/1. Projects/beacon.md",
+            llm_yaml="status: published\ntags:\n  - blockchain\n",
+        )
+        assert fm.get("status") != "published"
+        assert fm.get("status") in (None, *ALLOWED_STATUSES)
