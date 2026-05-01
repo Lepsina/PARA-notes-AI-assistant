@@ -15,6 +15,12 @@ obsassist metadata apply --tag <tag> [--vault <path>] [--remove-tag]
     Batch-apply metadata to all vault notes that contain the marker tag
     (in frontmatter tags list or as an inline #tag in the body).
 
+obsassist metadata audit [--path <sub-path>] [--format text|md|json]
+                         [--output <file>] [--top-tags N] [--config <path>]
+    Audit frontmatter health across the vault: counts missing/invalid fields,
+    reports type/status/lang distributions, top tags, and marker-tag occurrences.
+    Does NOT modify any notes.
+
 obsassist index build [--config <path>] [--index-path <path>]
     Full rebuild of the full-text search index from scratch.
 
@@ -39,7 +45,9 @@ from __future__ import annotations
 
 import json
 import sys
+from collections import Counter
 from concurrent.futures import ThreadPoolExecutor
+from datetime import date
 from pathlib import Path
 
 import click
@@ -54,7 +62,15 @@ from .diff import generate_diff
 from .embeddings import build_embeddings, update_embeddings
 from .filters import is_excluded
 from .indexer import build_index, update_index
-from .metadata_guard import ALLOWED_KEYS, apply_metadata_to_content, load_vocab, is_russian, strip_yaml_fences
+from .metadata_guard import (
+    ALLOWED_KEYS,
+    ALLOWED_STATUSES,
+    apply_metadata_to_content,
+    is_russian,
+    load_vocab,
+    split_frontmatter,
+    strip_yaml_fences,
+)
 from .tag_scanner import has_marker_tag, remove_marker_tag
 from .ollama_client import OllamaClient
 from .parser import (
@@ -826,6 +842,426 @@ def metadata_apply(
     if n_errors:
         summary_parts.append(f"Errors: [red]{n_errors}[/red]")
     console.print("\n[green]✓ Done.[/green]  " + "  ".join(summary_parts))
+
+
+# ---------------------------------------------------------------------------
+# metadata audit helpers
+# ---------------------------------------------------------------------------
+
+# Known valid LANG values (ISO 639-1 two-letter codes and common variants).
+_VALID_LANGS: frozenset[str] = frozenset(
+    {"ru", "en", "de", "fr", "es", "it", "zh", "ja", "ko", "pt", "pl", "uk"}
+)
+
+# Allowed type values (must stay in sync with metadata_guard.infer_type + archive).
+_ALLOWED_TYPES: frozenset[str] = frozenset(
+    {"daily", "project", "area", "resource", "note", "meeting", "archive"}
+)
+
+
+def _run_audit(
+    scan_root: Path,
+    vault_root_resolved: Path,
+    exclude_paths: list[str],
+    marker_tag: str,
+    top_n: int,
+) -> dict:
+    """Scan *scan_root* and collect audit metrics.  Returns a plain dict."""
+    total = 0
+    missing_frontmatter: list[str] = []
+    invalid_yaml: list[str] = []
+    missing_type: list[str] = []
+    missing_status: list[str] = []
+    missing_lang: list[str] = []
+    invalid_status: list[str] = []
+    invalid_type: list[str] = []
+    invalid_lang: list[str] = []
+    marker_files: list[str] = []
+    type_counter: Counter = Counter()
+    status_counter: Counter = Counter()
+    lang_counter: Counter = Counter()
+    tag_counter: Counter = Counter()
+
+    for md_path in sorted(scan_root.rglob("*.md")):
+        if is_excluded(md_path.resolve(), vault_root_resolved, exclude_paths):
+            continue
+        try:
+            content = md_path.read_text(encoding="utf-8")
+        except OSError:
+            continue
+
+        total += 1
+        rel = str(md_path.relative_to(vault_root_resolved))
+
+        # --- frontmatter presence & YAML validity ---
+        from .metadata_guard import _FM_RE  # local import to avoid circular
+        m = _FM_RE.match(content)
+        if not m:
+            missing_frontmatter.append(rel)
+            # Still check for marker tag in body
+            from .tag_scanner import has_marker_tag as _hmt
+            if _hmt(content, marker_tag):
+                marker_files.append(rel)
+            continue
+
+        try:
+            import yaml as _yaml
+            fm = _yaml.safe_load(m.group(1)) or {}
+            if not isinstance(fm, dict):
+                raise ValueError("non-mapping YAML")
+        except Exception:
+            invalid_yaml.append(rel)
+            from .tag_scanner import has_marker_tag as _hmt
+            if _hmt(content, marker_tag):
+                marker_files.append(rel)
+            continue
+
+        # --- marker tag ---
+        from .tag_scanner import has_marker_tag as _hmt
+        if _hmt(content, marker_tag):
+            marker_files.append(rel)
+
+        # --- type ---
+        t = fm.get("type")
+        if not t:
+            missing_type.append(rel)
+        else:
+            type_val = str(t).strip().lower()
+            type_counter[type_val] += 1
+            if type_val not in _ALLOWED_TYPES:
+                invalid_type.append(rel)
+
+        # --- status ---
+        s = fm.get("status")
+        if not s:
+            missing_status.append(rel)
+        else:
+            status_val = str(s).strip().lower()
+            status_counter[status_val] += 1
+            if status_val not in ALLOWED_STATUSES:
+                invalid_status.append(rel)
+
+        # --- lang ---
+        lang = fm.get("lang")
+        if not lang:
+            missing_lang.append(rel)
+        else:
+            lang_val = str(lang).strip().lower()
+            lang_counter[lang_val] += 1
+            if lang_val not in _VALID_LANGS:
+                invalid_lang.append(rel)
+
+        # --- tags (for top-N summary) ---
+        for tag in fm.get("tags") or []:
+            tag_counter[str(tag).lstrip("#").lower()] += 1
+
+    return {
+        "total": total,
+        "missing_frontmatter": missing_frontmatter,
+        "invalid_yaml": invalid_yaml,
+        "missing_type": missing_type,
+        "missing_status": missing_status,
+        "missing_lang": missing_lang,
+        "invalid_type": invalid_type,
+        "invalid_status": invalid_status,
+        "invalid_lang": invalid_lang,
+        "marker_files": marker_files,
+        "type_distribution": dict(type_counter.most_common()),
+        "status_distribution": dict(status_counter.most_common()),
+        "lang_distribution": dict(lang_counter.most_common()),
+        "top_tags": tag_counter.most_common(top_n),
+    }
+
+
+def _format_audit_text(data: dict, scan_root: Path, marker_tag: str, top_n: int) -> str:
+    """Format audit results as plain text."""
+    lines: list[str] = []
+    lines.append(f"Metadata Audit — {scan_root}")
+    lines.append("=" * 60)
+    lines.append(f"Total markdown files:       {data['total']}")
+    lines.append(f"Missing frontmatter:        {len(data['missing_frontmatter'])}")
+    lines.append(f"Invalid YAML frontmatter:   {len(data['invalid_yaml'])}")
+    lines.append(f"Missing type:               {len(data['missing_type'])}")
+    lines.append(f"Invalid type:               {len(data['invalid_type'])}")
+    lines.append(f"Missing status:             {len(data['missing_status'])}")
+    lines.append(f"Invalid status:             {len(data['invalid_status'])}")
+    lines.append(f"Missing lang:               {len(data['missing_lang'])}")
+    lines.append(f"Invalid lang:               {len(data['invalid_lang'])}")
+    lines.append(f"Files with #{marker_tag}:  {len(data['marker_files'])}")
+    lines.append("")
+
+    if data["type_distribution"]:
+        lines.append("Type distribution:")
+        for k, v in data["type_distribution"].items():
+            lines.append(f"  {k:<12} {v}")
+        lines.append("")
+
+    if data["status_distribution"]:
+        lines.append("Status distribution:")
+        for k, v in data["status_distribution"].items():
+            lines.append(f"  {k:<12} {v}")
+        lines.append("")
+
+    if data["lang_distribution"]:
+        lines.append("Lang distribution:")
+        for k, v in data["lang_distribution"].items():
+            lines.append(f"  {k:<12} {v}")
+        lines.append("")
+
+    if data["top_tags"]:
+        lines.append(f"Top {top_n} tags:")
+        for tag, cnt in data["top_tags"]:
+            lines.append(f"  #{tag:<20} {cnt}")
+        lines.append("")
+
+    failures = (
+        [("Missing frontmatter", p) for p in data["missing_frontmatter"]]
+        + [("Invalid YAML", p) for p in data["invalid_yaml"]]
+        + [("Invalid type", p) for p in data["invalid_type"]]
+        + [("Invalid status", p) for p in data["invalid_status"]]
+        + [("Invalid lang", p) for p in data["invalid_lang"]]
+    )
+    if failures:
+        lines.append(f"Issues ({len(failures)} total):")
+        for reason, path in failures[:50]:
+            lines.append(f"  [{reason}] {path}")
+        if len(failures) > 50:
+            lines.append(f"  … and {len(failures) - 50} more")
+    return "\n".join(lines)
+
+
+def _format_audit_md(data: dict, scan_root: Path, marker_tag: str, top_n: int) -> str:
+    """Format audit results as Markdown."""
+    today = date.today().isoformat()
+    lines: list[str] = []
+    lines.append(f"# Metadata Audit — {today}")
+    lines.append(f"\n**Scope:** `{scan_root}`\n")
+    lines.append("## Summary\n")
+    lines.append("| Metric | Count |")
+    lines.append("|---|---|")
+    lines.append(f"| Total markdown files | {data['total']} |")
+    lines.append(f"| Missing frontmatter | {len(data['missing_frontmatter'])} |")
+    lines.append(f"| Invalid YAML frontmatter | {len(data['invalid_yaml'])} |")
+    lines.append(f"| Missing `type` | {len(data['missing_type'])} |")
+    lines.append(f"| Invalid `type` | {len(data['invalid_type'])} |")
+    lines.append(f"| Missing `status` | {len(data['missing_status'])} |")
+    lines.append(f"| Invalid `status` | {len(data['invalid_status'])} |")
+    lines.append(f"| Missing `lang` | {len(data['missing_lang'])} |")
+    lines.append(f"| Invalid `lang` | {len(data['invalid_lang'])} |")
+    lines.append(f"| Files with `#{marker_tag}` | {len(data['marker_files'])} |")
+
+    if data["type_distribution"]:
+        lines.append("\n## Type Distribution\n")
+        lines.append("| Type | Count |")
+        lines.append("|---|---|")
+        for k, v in data["type_distribution"].items():
+            lines.append(f"| `{k}` | {v} |")
+
+    if data["status_distribution"]:
+        lines.append("\n## Status Distribution\n")
+        lines.append("| Status | Count |")
+        lines.append("|---|---|")
+        for k, v in data["status_distribution"].items():
+            lines.append(f"| `{k}` | {v} |")
+
+    if data["lang_distribution"]:
+        lines.append("\n## Lang Distribution\n")
+        lines.append("| Lang | Count |")
+        lines.append("|---|---|")
+        for k, v in data["lang_distribution"].items():
+            lines.append(f"| `{k}` | {v} |")
+
+    if data["top_tags"]:
+        lines.append(f"\n## Top {top_n} Tags\n")
+        lines.append("| Tag | Count |")
+        lines.append("|---|---|")
+        for tag, cnt in data["top_tags"]:
+            lines.append(f"| `#{tag}` | {cnt} |")
+
+    failures = (
+        [("Missing frontmatter", p) for p in data["missing_frontmatter"]]
+        + [("Invalid YAML", p) for p in data["invalid_yaml"]]
+        + [("Invalid type", p) for p in data["invalid_type"]]
+        + [("Invalid status", p) for p in data["invalid_status"]]
+        + [("Invalid lang", p) for p in data["invalid_lang"]]
+    )
+    if failures:
+        lines.append(f"\n## Issues ({len(failures)} total)\n")
+        for reason, path in failures[:50]:
+            lines.append(f"- **{reason}**: `{path}`")
+        if len(failures) > 50:
+            lines.append(f"\n_… and {len(failures) - 50} more_")
+
+    return "\n".join(lines) + "\n"
+
+
+# ---------------------------------------------------------------------------
+# metadata audit command
+# ---------------------------------------------------------------------------
+
+
+@metadata.command("audit")
+@click.option(
+    "--path",
+    "scope_path",
+    default=None,
+    type=click.Path(),
+    help="Restrict the scan to this sub-path within the vault (default: entire vault).",
+)
+@click.option(
+    "--format",
+    "output_format",
+    type=click.Choice(["text", "md", "json"], case_sensitive=False),
+    default="text",
+    show_default=True,
+    help="Output format for the audit report.",
+)
+@click.option(
+    "--output",
+    "output_path",
+    default=None,
+    type=click.Path(),
+    help=(
+        "Write the report to this file.  "
+        "When --format md and --output is not set, the report is written to "
+        "<vault>/.obsassist/reports/metadata-audit-YYYY-MM-DD.md."
+    ),
+)
+@click.option(
+    "--tag",
+    "-t",
+    "marker_tag",
+    default="add-metadata",
+    show_default=True,
+    help="Marker tag to count (leading '#' optional).",
+)
+@click.option(
+    "--top-tags",
+    "top_n",
+    default=10,
+    show_default=True,
+    help="Number of most-common tags to include in the report.",
+)
+@click.option(
+    "--config",
+    "-c",
+    "config_path",
+    default=None,
+    type=click.Path(exists=True),
+    help="Path to a YAML config file (default: config.yml in cwd).",
+)
+def metadata_audit(
+    scope_path: str | None,
+    output_format: str,
+    output_path: str | None,
+    marker_tag: str,
+    top_n: int,
+    config_path: str | None,
+) -> None:
+    """Audit frontmatter health across the vault (read-only).
+
+    Scans all Markdown files and reports:
+    - total file count
+    - missing / invalid frontmatter
+    - type / status / lang distributions and invalid values
+    - count of files carrying the marker tag
+    - top N most common tags
+
+    No files are modified.
+
+    Examples:
+
+    \b
+      # Quick text summary
+      obsassist metadata audit
+
+    \b
+      # Full Markdown report saved to default location
+      obsassist metadata audit --format md
+
+    \b
+      # Audit a sub-folder only, JSON output
+      obsassist metadata audit --path "1. Projects" --format json
+
+    \b
+      # Save report to a custom file
+      obsassist metadata audit --format md --output report.md
+    """
+    cfg = load_config(Path(config_path) if config_path else None)
+
+    if not cfg.vault_root:
+        console.print(
+            "[red]Error:[/red] vault_root is not set. "
+            "Add it to your config.yml or set --config."
+        )
+        sys.exit(1)
+
+    vault_root = Path(cfg.vault_root)
+    if not vault_root.is_dir():
+        console.print(f"[red]Error:[/red] vault_root does not exist: {vault_root}")
+        sys.exit(1)
+
+    # Resolve scan root
+    if scope_path:
+        scan_root = vault_root / scope_path
+        if not scan_root.is_dir():
+            console.print(
+                f"[red]Error:[/red] --path '{scope_path}' does not exist "
+                f"inside vault_root: {vault_root}"
+            )
+            sys.exit(1)
+    else:
+        scan_root = vault_root
+
+    vault_root_resolved = vault_root.resolve()
+    bare_tag = marker_tag.lstrip("#")
+    fmt = output_format.lower()
+
+    # Only print the progress header for non-JSON formats (JSON must be clean stdout)
+    if fmt != "json" or output_path:
+        console.print(
+            f"[cyan]Auditing vault:[/cyan] {scan_root}  "
+            f"[dim]marker={bare_tag}[/dim]"
+        )
+
+    with console.status("[yellow]Scanning…[/yellow]"):
+        data = _run_audit(scan_root, vault_root_resolved, cfg.exclude_paths, bare_tag, top_n)
+
+    # ------------------------------------------------------------------
+    # Format output
+    # ------------------------------------------------------------------
+    if fmt == "json":
+        report_text = json.dumps(
+            {
+                **data,
+                # Convert top_tags from list-of-tuples to list-of-dicts for JSON
+                "top_tags": [{"tag": t, "count": c} for t, c in data["top_tags"]],
+            },
+            ensure_ascii=False,
+            indent=2,
+        )
+    elif fmt == "md":
+        report_text = _format_audit_md(data, scan_root, bare_tag, top_n)
+    else:
+        report_text = _format_audit_text(data, scan_root, bare_tag, top_n)
+
+    # ------------------------------------------------------------------
+    # Write / print
+    # ------------------------------------------------------------------
+    if output_path:
+        dest = Path(output_path)
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        dest.write_text(report_text, encoding="utf-8")
+        console.print(f"[green]✓ Report written:[/green] {dest}")
+    elif fmt == "md":
+        today = date.today().isoformat()
+        dest = vault_root / ".obsassist" / "reports" / f"metadata-audit-{today}.md"
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        dest.write_text(report_text, encoding="utf-8")
+        console.print(f"[green]✓ Report written:[/green] {dest}")
+        console.print(report_text)
+    else:
+        console.print(report_text)
 
 
 # ---------------------------------------------------------------------------

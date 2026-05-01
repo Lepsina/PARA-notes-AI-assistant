@@ -110,6 +110,7 @@ def infer_type(note_path: Path | str | None) -> str:
     - ``Projects/`` or ``1. Projects/`` folder                       → ``project``
     - ``Areas/`` or ``2. Areas/`` folder                             → ``area``
     - ``Resources/`` or ``3. Resources/`` folder                     → ``resource``
+    - ``Archive/`` or ``4. Archive/`` folder                         → ``archive``
     - ``Buffer/`` or ``0. Buffer/`` folder                           → ``note``
     - anything else                                                   → ``note``
 
@@ -136,6 +137,8 @@ def infer_type(note_path: Path | str | None) -> str:
             return "area"
         if normalized == "resources":
             return "resource"
+        if normalized == "archive":
+            return "archive"
 
     return "note"
 
@@ -171,6 +174,13 @@ def infer_status(
     - otherwise                        → ``None`` (do not set)
     """
     path = Path(note_path) if note_path else None
+
+    # Archive folder → archived (supports both plain and numbered form)
+    if path is not None:
+        parts_lower = [p.lower() for p in path.parts]
+        for part in parts_lower:
+            if _strip_numbered_prefix(part) == "archive":
+                return "archived"
 
     # Buffer folder → draft (supports both plain and numbered form)
     if path is not None:

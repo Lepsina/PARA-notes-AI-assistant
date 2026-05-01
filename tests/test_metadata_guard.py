@@ -565,6 +565,19 @@ class TestInferType:
         # date-matching filename beats folder
         assert infer_type(Path("Projects/2024-01-01-review.md")) == "daily"
 
+    # PR8: Archive folder
+    def test_archive_folder_plain(self):
+        assert infer_type(Path("vault/Archive/old-note.md")) == "archive"
+
+    def test_archive_folder_numbered(self):
+        assert infer_type(Path("vault/4. Archive/old-note.md")) == "archive"
+
+    def test_archive_folder_case_insensitive(self):
+        assert infer_type(Path("vault/ARCHIVE/file.md")) == "archive"
+
+    def test_archive_subfolder(self):
+        assert infer_type(Path("vault/4. Archive/Projects/finished.md")) == "archive"
+
 
 # ---------------------------------------------------------------------------
 # PR6: Deterministic status inference
@@ -602,6 +615,17 @@ class TestInferStatus:
 
     def test_none_path_with_no_special_tags_returns_none(self):
         assert infer_status(None) is None
+
+    # PR8: Archive folder → archived
+    def test_archive_folder_plain_returns_archived(self):
+        assert infer_status(Path("vault/Archive/old.md")) == "archived"
+
+    def test_archive_folder_numbered_returns_archived(self):
+        assert infer_status(Path("vault/4. Archive/old.md")) == "archived"
+
+    def test_archive_overrides_tags(self):
+        # Archive folder takes priority over tag-based overrides
+        assert infer_status(Path("vault/4. Archive/note.md"), tags=["просмотреть"]) == "archived"
 
 
 # ---------------------------------------------------------------------------
@@ -1327,3 +1351,19 @@ class TestSamplePathIntegration:
         )
         assert fm.get("status") != "published"
         assert fm.get("status") in (None, *ALLOWED_STATUSES)
+
+    # PR8: Archive folder policy
+    def test_numbered_archive_path(self):
+        fm = self._apply("vault/4. Archive/old-project.md")
+        assert fm["type"] == "archive"
+        assert fm["status"] == "archived"
+
+    def test_plain_archive_path(self):
+        fm = self._apply("vault/Archive/old-note.md")
+        assert fm["type"] == "archive"
+        assert fm["status"] == "archived"
+
+    def test_archive_subfolder(self):
+        fm = self._apply("vault/4. Archive/Projects/finished.md")
+        assert fm["type"] == "archive"
+        assert fm["status"] == "archived"
