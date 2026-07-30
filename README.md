@@ -230,6 +230,7 @@ Both plain folder names (`Projects/`) and the numbered PARA layout (`1. Projects
 | `Projects/` **or** `1. Projects/` folder | `project` |
 | `Areas/` **or** `2. Areas/` folder | `area` |
 | `Resources/` **or** `3. Resources/` folder | `resource` |
+| `Archive/` **or** `4. Archive/` folder | `archive` |
 | `Buffer/` **or** `0. Buffer/` folder | `note` |
 | everything else | `note` |
 
@@ -241,11 +242,26 @@ Any other value found in existing frontmatter (e.g. `published`) is removed with
 
 | Condition | `status` |
 |---|---|
+| Path is inside `Archive/` or `4. Archive/` | `archived` |
 | Path is inside `Buffer/` or `0. Buffer/` | `draft` |
 | Note contains tag `#дописать` | `draft` |
 | Note contains tag `#просмотреть` | `active` |
 | Note type is `project` or `area` | `active` (configurable) |
 | Everything else | *(not set)* |
+
+#### Archive folder policy (`4. Archive/`)
+
+Notes stored under `Archive/` or `4. Archive/` (the numbered PARA layout) receive:
+
+| Field | Value | Source |
+|---|---|---|
+| `type` | `archive` | Path-based inference |
+| `status` | `archived` | Path-based inference |
+
+This means you can move any note into the Archive folder and the metadata will be
+updated automatically on the next `metadata apply` or `metadata update` run — without
+any manual editing.  The `archive` type is included in the allowed type enum alongside
+`daily`, `project`, `area`, `resource`, `note`, and `meeting`.
 
 #### Russian-only `summary`
 
@@ -374,6 +390,87 @@ each successful write.  Pass `--resume` on the next run to skip those files.
 * `--remove-tag` only removes the marker when the write succeeds; on any
   error the note is left completely unchanged.
 * In `--dry-run` mode no files are written and no markers are removed.
+
+---
+
+## Metadata audit: `metadata audit`
+
+The `metadata audit` command scans your entire vault (or a sub-path) and
+produces a **read-only** health report for all Markdown notes.  **No files
+are modified.**
+
+### What it reports
+
+| Metric | Description |
+|---|---|
+| Total markdown files | Count of all `.md` files in scope |
+| Missing frontmatter | Files with no YAML `---` block |
+| Invalid YAML | Files whose frontmatter cannot be parsed |
+| Missing / invalid `type` | Files without `type`, or with an unrecognised value |
+| Missing / invalid `status` | Files without `status`, or with a value outside the allowed set |
+| Missing / invalid `lang` | Files without `lang`, or with an unknown language code |
+| Files with marker tag | Count of files still carrying the processing tag (e.g. `add-metadata`) |
+| Type / status / lang distributions | How values are spread across the vault |
+| Top N tags | Most common tags across all frontmatter `tags` fields |
+| Issue list | Per-file list of validation failures |
+
+### Quick text summary (default)
+
+```powershell
+obsassist metadata audit --config "C:\path\to\config.yml"
+```
+
+Prints a concise plain-text report to stdout.
+
+### Markdown report (saved to file)
+
+```powershell
+obsassist metadata audit --format md --config "C:\path\to\config.yml"
+```
+
+Saves a full Markdown report to
+`<vault>/.obsassist/reports/metadata-audit-YYYY-MM-DD.md` and also
+prints it to stdout.
+
+### JSON output (for scripting)
+
+```powershell
+obsassist metadata audit --format json --config "C:\path\to\config.yml"
+```
+
+Outputs a JSON object to stdout — useful for piping into other tools.
+
+### Audit a sub-folder only
+
+```powershell
+obsassist metadata audit --path "1. Projects" --format md --config "C:\path\to\config.yml"
+```
+
+### Save report to a custom path
+
+```powershell
+obsassist metadata audit --format md --output "C:\reports\my-audit.md" --config "C:\path\to\config.yml"
+```
+
+### Change the marker tag to count
+
+```powershell
+obsassist metadata audit --tag add-metadata --config "C:\path\to\config.yml"
+```
+
+### All options
+
+| Flag | Default | Description |
+|---|---|---|
+| `--path` | *(vault root)* | Restrict scan to this sub-path inside the vault |
+| `--format` | `text` | Output format: `text`, `md`, or `json` |
+| `--output` | *(see below)* | Write report to this file path |
+| `--tag` / `-t` | `add-metadata` | Marker tag to count (leading `#` optional) |
+| `--top-tags` | `10` | Number of most-common tags to include |
+| `--config` / `-c` | `config.yml` | Path to a YAML config file |
+
+When `--format md` and `--output` is not set, the report is written to
+`<vault>/.obsassist/reports/metadata-audit-YYYY-MM-DD.md`.
 
 ---
 
